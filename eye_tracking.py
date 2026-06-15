@@ -1,5 +1,9 @@
 import argparse
+import csv
+import time
+from collections import Counter, deque
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -11,6 +15,105 @@ class GazeResult:
     pupil_center: tuple[int, int] | None
     ratio_x: float | None
     ratio_y: float | None
+    confidence: float
+
+
+@dataclass
+class FrameResult:
+    frame: np.ndarray
+    raw_direction: str
+    stable_direction: str
+    ratio_x: float | None
+    ratio_y: float | None
+    eyes_found: int
+
+
+class GazeEstimator:
+    def __init__(self, history_size: int = 9) -> None:
+        self.center_x = 0.5
+        self.center_y = 0.5
+        self.history: deque[str] = deque(maxlen=history_size)
+
+    def calibrate(self, ratio_x: float | None, ratio_y: float | None) -> bool:
+        if ratio_x is None or ratio_y is None:
+            return False
+
+        self.center_x = ratio_x
+        self.center_y = ratio_y
+        self.history.clear()
+        return True
+
+    def classify(self, ratio_x: float | None, ratio_y: float | None) -> str:
+        if ratio_x is None or ratio_y is None:
+            return "unknown"
+
+        dx = ratio_x - self.center_x
+        dy = ratio_y - self.center_y
+
+        if dx < -0.14:
+            horizontal = "left"
+        elif dx > 0.14:
+            horizontal = "right"
+        else:
+            horizontal = "center"
+
+        if dy < -0.13:
+            vertical = "up"
+        elif dy > 0.16:
+            vertical = "down"
+        else:
+            vertical = "center"
+
+        if horizontal == "center" and vertical == "center":
+            return "center"
+        if vertical == "center":
+            return horizontal
+        if horizontal == "center":
+            return vertical
+        return f"{vertical}-{horizontal}"
+
+    def smooth(self, direction: str) -> str:
+        if direction != "unknown":
+            self.history.append(direction)
+
+        if not self.history:
+            return "unknown"
+
+        return Counter(self.history).most_common(1)[0][0]
+
+
+class CsvLogger:
+    def __init__(self, path: Path | None) -> None:
+        self.file = None
+        self.writer = None
+
+        if path is None:
+            return
+
+        self.file = path.open("w", newline="", encoding="utf-8")
+        self.writer = csv.writer(self.file)
+        self.writer.writerow(
+            ["timestamp", "raw_direction", "stable_direction", "ratio_x", "ratio_y", "eyes_found"]
+        )
+
+    def write(self, result: FrameResult) -> None:
+        if self.writer is None:
+            return
+
+        self.writer.writerow(
+            [
+                f"{time.time():.3f}",
+                result.raw_direction,
+                result.stable_direction,
+                "" if result.ratio_x is None else f"{result.ratio_x:.4f}",
+                "" if result.ratio_y is None else f"{result.ratio_y:.4f}",
+                result.eyes_found,
+            ]
+        )
+
+    def close(self) -> None:
+        if self.file is not None:
+            self.file.close()
 
 
 def load_cascade(name: str) -> cv2.CascadeClassifier:
@@ -21,69 +124,52 @@ def load_cascade(name: str) -> cv2.CascadeClassifier:
     return cascade
 
 
-def detect_pupil(eye_gray: np.ndarray) -> GazeResult:
+def detect_pupil(eye_gray: np.ndarray, threshold_offset: int = 0) -> GazeResult:
     blurred = cv2.GaussianBlur(eye_gray, (7, 7), 0)
-
-    # The pupil is usually one of the darkest areas in the eye crop.
-    _, threshold = cv2.threshold(
-        blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-    )
+    otsu_value, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    threshold_value = int(np.clip(otsu_value + threshold_offset, 5, 250))
+    _, threshold = cv2.threshold(blurred, threshold_value, 255, cv2.THRESH_BINARY_INV)
 
     kernel = np.ones((3, 3), np.uint8)
     threshold = cv2.morphologyEx(threshold, cv2.MORPH_OPEN, kernel, iterations=1)
+    threshold = cv2.morphologyEx(threshold, cv2.MORPH_CLOSE, kernel, iterations=1)
+
     contours, _ = cv2.findContours(
         threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
 
     if not contours:
-        return GazeResult("unknown", None, None, None)
+        return GazeResult("unknown", None, None, None, 0.0)
 
     height, width = eye_gray.shape[:2]
-    min_area = max(8, int(width * height * 0.01))
-    candidates = [cnt for cnt in contours if cv2.contourArea(cnt) >= min_area]
+    eye_area = width * height
+    min_area = max(8, int(eye_area * 0.01))
+    max_area = int(eye_area * 0.45)
+    candidates = [
+        cnt for cnt in contours if min_area <= cv2.contourArea(cnt) <= max_area
+    ]
 
     if not candidates:
-        return GazeResult("unknown", None, None, None)
+        return GazeResult("unknown", None, None, None, 0.0)
 
     pupil = max(candidates, key=cv2.contourArea)
     moments = cv2.moments(pupil)
     if moments["m00"] == 0:
-        return GazeResult("unknown", None, None, None)
+        return GazeResult("unknown", None, None, None, 0.0)
 
     center_x = int(moments["m10"] / moments["m00"])
     center_y = int(moments["m01"] / moments["m00"])
     ratio_x = center_x / max(1, width)
     ratio_y = center_y / max(1, height)
+    confidence = min(1.0, cv2.contourArea(pupil) / max(1, eye_area * 0.12))
 
-    if ratio_x < 0.38:
-        horizontal = "left"
-    elif ratio_x > 0.62:
-        horizontal = "right"
-    else:
-        horizontal = "center"
-
-    if ratio_y < 0.36:
-        vertical = "up"
-    elif ratio_y > 0.68:
-        vertical = "down"
-    else:
-        vertical = "center"
-
-    if horizontal == "center" and vertical == "center":
-        direction = "center"
-    elif vertical == "center":
-        direction = horizontal
-    elif horizontal == "center":
-        direction = vertical
-    else:
-        direction = f"{vertical}-{horizontal}"
-
-    return GazeResult(direction, (center_x, center_y), ratio_x, ratio_y)
+    return GazeResult("detected", (center_x, center_y), ratio_x, ratio_y, confidence)
 
 
 def draw_eye_result(frame: np.ndarray, eye_box: tuple[int, int, int, int], result: GazeResult) -> None:
     x, y, width, height = eye_box
-    cv2.rectangle(frame, (x, y), (x + width, y + height), (80, 220, 120), 2)
+    color = (80, 220, 120) if result.pupil_center else (90, 90, 255)
+    cv2.rectangle(frame, (x, y), (x + width, y + height), color, 2)
 
     if result.pupil_center is None:
         return
@@ -93,45 +179,70 @@ def draw_eye_result(frame: np.ndarray, eye_box: tuple[int, int, int, int], resul
     cv2.circle(frame, (pupil_x, pupil_y), 4, (0, 0, 255), -1)
 
 
-def combine_directions(results: list[GazeResult]) -> str:
-    known = [item for item in results if item.direction != "unknown"]
+def average_gaze(results: list[GazeResult]) -> tuple[float | None, float | None]:
+    known = [item for item in results if item.ratio_x is not None and item.ratio_y is not None]
     if not known:
-        return "unknown"
+        return None, None
 
-    avg_x = float(np.mean([item.ratio_x for item in known if item.ratio_x is not None]))
-    avg_y = float(np.mean([item.ratio_y for item in known if item.ratio_y is not None]))
+    weights = np.array([max(0.1, item.confidence) for item in known], dtype=np.float32)
+    xs = np.array([item.ratio_x for item in known], dtype=np.float32)
+    ys = np.array([item.ratio_y for item in known], dtype=np.float32)
+    return float(np.average(xs, weights=weights)), float(np.average(ys, weights=weights))
 
-    if avg_x < 0.38:
-        horizontal = "left"
-    elif avg_x > 0.62:
-        horizontal = "right"
-    else:
-        horizontal = "center"
 
-    if avg_y < 0.36:
-        vertical = "up"
-    elif avg_y > 0.68:
-        vertical = "down"
-    else:
-        vertical = "center"
+def draw_hud(
+    frame: np.ndarray,
+    result: FrameResult,
+    estimator: GazeEstimator,
+    threshold_offset: int,
+    log_enabled: bool,
+) -> None:
+    lines = [
+        f"Gaze: {result.stable_direction}  raw: {result.raw_direction}",
+        f"Eyes: {result.eyes_found}  Center: {estimator.center_x:.2f}, {estimator.center_y:.2f}",
+        f"Threshold offset: {threshold_offset}  Log: {'on' if log_enabled else 'off'}",
+        "C - calibrate center | +/- threshold | Q - exit",
+    ]
 
-    if horizontal == "center" and vertical == "center":
-        return "center"
-    if vertical == "center":
-        return horizontal
-    if horizontal == "center":
-        return vertical
-    return f"{vertical}-{horizontal}"
+    y = 34
+    for line in lines:
+        cv2.putText(
+            frame,
+            line,
+            (18, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (20, 20, 20),
+            4,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            line,
+            (18, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (40, 240, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        y += 28
 
 
 def process_frame(
     frame: np.ndarray,
     face_cascade: cv2.CascadeClassifier,
     eye_cascade: cv2.CascadeClassifier,
-) -> np.ndarray:
+    estimator: GazeEstimator,
+    threshold_offset: int,
+    log_enabled: bool,
+) -> FrameResult:
     frame = cv2.flip(frame, 1)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80))
+    gray = cv2.equalizeHist(gray)
+    faces = face_cascade.detectMultiScale(
+        gray, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)
+    )
 
     gaze_results: list[GazeResult] = []
 
@@ -157,37 +268,31 @@ def process_frame(
         for eye_x, eye_y, eye_w, eye_h in eyes:
             absolute_box = (face_x + eye_x, face_y + eye_y, eye_w, eye_h)
             eye_gray = upper_face_gray[eye_y : eye_y + eye_h, eye_x : eye_x + eye_w]
-            result = detect_pupil(eye_gray)
+            result = detect_pupil(eye_gray, threshold_offset)
             gaze_results.append(result)
             draw_eye_result(frame, absolute_box, result)
 
-    gaze = combine_directions(gaze_results)
-    cv2.putText(
-        frame,
-        f"Gaze: {gaze}",
-        (24, 44),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (40, 240, 255),
-        2,
-        cv2.LINE_AA,
+    ratio_x, ratio_y = average_gaze(gaze_results)
+    raw_direction = estimator.classify(ratio_x, ratio_y)
+    stable_direction = estimator.smooth(raw_direction)
+
+    result = FrameResult(
+        frame=frame,
+        raw_direction=raw_direction,
+        stable_direction=stable_direction,
+        ratio_x=ratio_x,
+        ratio_y=ratio_y,
+        eyes_found=len(gaze_results),
     )
-    cv2.putText(
-        frame,
-        "Press Q to exit",
-        (24, frame.shape[0] - 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (230, 230, 230),
-        2,
-        cv2.LINE_AA,
-    )
-    return frame
+    draw_hud(frame, result, estimator, threshold_offset, log_enabled)
+    return result
 
 
-def run(camera_index: int) -> None:
+def run(camera_index: int, log_path: Path | None, threshold_offset: int) -> None:
     face_cascade = load_cascade("haarcascade_frontalface_default.xml")
     eye_cascade = load_cascade("haarcascade_eye.xml")
+    estimator = GazeEstimator()
+    logger = CsvLogger(log_path)
 
     camera = cv2.VideoCapture(camera_index)
     if not camera.isOpened():
@@ -201,12 +306,28 @@ def run(camera_index: int) -> None:
             if not ok:
                 raise RuntimeError("Cannot read frame from camera.")
 
-            result = process_frame(frame, face_cascade, eye_cascade)
-            cv2.imshow("Simple Eye Tracking", result)
+            result = process_frame(
+                frame,
+                face_cascade,
+                eye_cascade,
+                estimator,
+                threshold_offset,
+                log_path is not None,
+            )
+            logger.write(result)
+            cv2.imshow("Simple Eye Tracking", result.frame)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 break
+            if key == ord("c"):
+                estimator.calibrate(result.ratio_x, result.ratio_y)
+            if key in (ord("+"), ord("=")):
+                threshold_offset = min(60, threshold_offset + 2)
+            if key in (ord("-"), ord("_")):
+                threshold_offset = max(-60, threshold_offset - 2)
     finally:
+        logger.close()
         camera.release()
         cv2.destroyAllWindows()
 
@@ -219,9 +340,25 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Camera index, usually 0 for the built-in webcam.",
     )
+    parser.add_argument(
+        "--log",
+        type=Path,
+        default=None,
+        help="Optional CSV file for saving gaze measurements.",
+    )
+    parser.add_argument(
+        "--threshold-offset",
+        type=int,
+        default=0,
+        help="Manual pupil threshold correction from -60 to 60.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run(args.camera)
+    run(
+        camera_index=args.camera,
+        log_path=args.log,
+        threshold_offset=int(np.clip(args.threshold_offset, -60, 60)),
+    )
