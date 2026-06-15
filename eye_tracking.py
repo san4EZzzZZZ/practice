@@ -1,4 +1,6 @@
 import argparse
+import ctypes
+import ctypes.wintypes
 import csv
 import time
 from collections import Counter, deque
@@ -116,6 +118,48 @@ class CsvLogger:
             self.file.close()
 
 
+class CursorController:
+    def __init__(self, available: bool, speed: int) -> None:
+        self.available = available and hasattr(ctypes, "windll")
+        self.active = False
+        self.speed = speed
+        self.user32 = ctypes.windll.user32 if self.available else None
+
+    def toggle(self) -> None:
+        if self.available:
+            self.active = not self.active
+
+    def status(self) -> str:
+        if not self.available:
+            return "disabled"
+        return "on" if self.active else "off"
+
+    def move(self, direction: str) -> None:
+        if not self.available or not self.active or direction in ("center", "unknown"):
+            return
+
+        dx = 0
+        dy = 0
+        step = self.speed
+
+        if "left" in direction:
+            dx = -step
+        if "right" in direction:
+            dx = step
+        if "up" in direction:
+            dy = -step
+        if "down" in direction:
+            dy = step
+
+        point = ctypes.wintypes.POINT()
+        self.user32.GetCursorPos(ctypes.byref(point))
+        screen_w = self.user32.GetSystemMetrics(0)
+        screen_h = self.user32.GetSystemMetrics(1)
+        new_x = int(np.clip(point.x + dx, 0, screen_w - 1))
+        new_y = int(np.clip(point.y + dy, 0, screen_h - 1))
+        self.user32.SetCursorPos(new_x, new_y)
+
+
 def load_cascade(name: str) -> cv2.CascadeClassifier:
     path = cv2.data.haarcascades + name
     cascade = cv2.CascadeClassifier(path)
@@ -196,12 +240,13 @@ def draw_hud(
     estimator: GazeEstimator,
     threshold_offset: int,
     log_enabled: bool,
+    cursor_status: str,
 ) -> None:
     lines = [
         f"Gaze: {result.stable_direction}  raw: {result.raw_direction}",
         f"Eyes: {result.eyes_found}  Center: {estimator.center_x:.2f}, {estimator.center_y:.2f}",
-        f"Threshold offset: {threshold_offset}  Log: {'on' if log_enabled else 'off'}",
-        "C - calibrate center | +/- threshold | Q - exit",
+        f"Threshold offset: {threshold_offset}  Log: {'on' if log_enabled else 'off'}  Cursor: {cursor_status}",
+        "C - calibrate | M - cursor | +/- threshold | Q - exit",
     ]
 
     y = 34
@@ -236,6 +281,7 @@ def process_frame(
     estimator: GazeEstimator,
     threshold_offset: int,
     log_enabled: bool,
+    cursor_status: str,
 ) -> FrameResult:
     frame = cv2.flip(frame, 1)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -284,15 +330,22 @@ def process_frame(
         ratio_y=ratio_y,
         eyes_found=len(gaze_results),
     )
-    draw_hud(frame, result, estimator, threshold_offset, log_enabled)
+    draw_hud(frame, result, estimator, threshold_offset, log_enabled, cursor_status)
     return result
 
 
-def run(camera_index: int, log_path: Path | None, threshold_offset: int) -> None:
+def run(
+    camera_index: int,
+    log_path: Path | None,
+    threshold_offset: int,
+    control_cursor: bool,
+    cursor_speed: int,
+) -> None:
     face_cascade = load_cascade("haarcascade_frontalface_default.xml")
     eye_cascade = load_cascade("haarcascade_eye.xml")
     estimator = GazeEstimator()
     logger = CsvLogger(log_path)
+    cursor = CursorController(control_cursor, cursor_speed)
 
     camera = cv2.VideoCapture(camera_index)
     if not camera.isOpened():
@@ -313,8 +366,10 @@ def run(camera_index: int, log_path: Path | None, threshold_offset: int) -> None
                 estimator,
                 threshold_offset,
                 log_path is not None,
+                cursor.status(),
             )
             logger.write(result)
+            cursor.move(result.stable_direction)
             cv2.imshow("Simple Eye Tracking", result.frame)
 
             key = cv2.waitKey(1) & 0xFF
@@ -322,6 +377,8 @@ def run(camera_index: int, log_path: Path | None, threshold_offset: int) -> None
                 break
             if key == ord("c"):
                 estimator.calibrate(result.ratio_x, result.ratio_y)
+            if key == ord("m"):
+                cursor.toggle()
             if key in (ord("+"), ord("=")):
                 threshold_offset = min(60, threshold_offset + 2)
             if key in (ord("-"), ord("_")):
@@ -352,6 +409,17 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Manual pupil threshold correction from -60 to 60.",
     )
+    parser.add_argument(
+        "--control-cursor",
+        action="store_true",
+        help="Enable gaze-based cursor control. Press M in the video window to toggle it.",
+    )
+    parser.add_argument(
+        "--cursor-speed",
+        type=int,
+        default=18,
+        help="Cursor movement step in pixels per frame.",
+    )
     return parser.parse_args()
 
 
@@ -361,4 +429,6 @@ if __name__ == "__main__":
         camera_index=args.camera,
         log_path=args.log,
         threshold_offset=int(np.clip(args.threshold_offset, -60, 60)),
+        control_cursor=args.control_cursor,
+        cursor_speed=max(1, args.cursor_speed),
     )
