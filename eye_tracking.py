@@ -40,6 +40,7 @@ class FrameResult:
     stable_direction: str
     ratio_x: float | None
     ratio_y: float | None
+    confidence: float
     eyes_found: int
 
 
@@ -58,6 +59,16 @@ FACE_LANDMARKER_MODEL_URL = (
     "face_landmarker/float16/latest/face_landmarker.task"
 )
 FACE_LANDMARKER_MODEL_PATH = Path(".cache/mediapipe/face_landmarker.task")
+
+COLOR_PANEL = (18, 22, 30)
+COLOR_PANEL_2 = (29, 34, 45)
+COLOR_TEXT = (235, 242, 248)
+COLOR_MUTED = (160, 172, 184)
+COLOR_ACCENT = (51, 217, 178)
+COLOR_WARN = (80, 170, 255)
+COLOR_DANGER = (95, 95, 255)
+COLOR_BLUE = (255, 180, 90)
+VIGNETTE_CACHE: dict[tuple[int, int], np.ndarray] = {}
 
 
 class GazeEstimator:
@@ -149,9 +160,9 @@ class CsvLogger:
 
 
 class CursorController:
-    def __init__(self, available: bool, speed: int) -> None:
-        self.available = available and hasattr(ctypes, "windll")
-        self.active = False
+    def __init__(self, active_by_default: bool, speed: int) -> None:
+        self.available = hasattr(ctypes, "windll")
+        self.active = active_by_default and self.available
         self.speed = speed
         self.user32 = ctypes.windll.user32 if self.available else None
 
@@ -161,7 +172,7 @@ class CursorController:
 
     def status(self) -> str:
         if not self.available:
-            return "disabled"
+            return "unavailable"
         return "on" if self.active else "off"
 
     def move(self, direction: str) -> None:
@@ -311,15 +322,124 @@ def draw_landmark_eye(
         cv2.circle(frame, result.pupil_center, 8, (40, 240, 255), 1, cv2.LINE_AA)
 
 
-def average_gaze(results: list[GazeResult]) -> tuple[float | None, float | None]:
+def average_gaze(results: list[GazeResult]) -> tuple[float | None, float | None, float]:
     known = [item for item in results if item.ratio_x is not None and item.ratio_y is not None]
     if not known:
-        return None, None
+        return None, None, 0.0
 
     weights = np.array([max(0.1, item.confidence) for item in known], dtype=np.float32)
     xs = np.array([item.ratio_x for item in known], dtype=np.float32)
     ys = np.array([item.ratio_y for item in known], dtype=np.float32)
-    return float(np.average(xs, weights=weights)), float(np.average(ys, weights=weights))
+    confidence = float(np.clip(np.mean([item.confidence for item in known]), 0.0, 1.0))
+    return (
+        float(np.average(xs, weights=weights)),
+        float(np.average(ys, weights=weights)),
+        confidence,
+    )
+
+
+def blend_rect(
+    frame: np.ndarray,
+    top_left: tuple[int, int],
+    bottom_right: tuple[int, int],
+    color: tuple[int, int, int],
+    alpha: float,
+) -> None:
+    overlay = frame.copy()
+    cv2.rectangle(overlay, top_left, bottom_right, color, -1)
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+
+def put_text(
+    frame: np.ndarray,
+    text: str,
+    origin: tuple[int, int],
+    scale: float,
+    color: tuple[int, int, int] = COLOR_TEXT,
+    thickness: int = 1,
+) -> None:
+    cv2.putText(
+        frame,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def apply_vignette(frame: np.ndarray) -> None:
+    height, width = frame.shape[:2]
+    cache_key = (width, height)
+    mask = VIGNETTE_CACHE.get(cache_key)
+    if mask is None:
+        x = np.linspace(-1.0, 1.0, width)
+        y = np.linspace(-1.0, 1.0, height)
+        xv, yv = np.meshgrid(x, y)
+        mask = 1.0 - np.clip((xv * xv + yv * yv - 0.28) * 0.42, 0.0, 0.35)
+        VIGNETTE_CACHE[cache_key] = mask
+    frame[:] = (frame.astype(np.float32) * mask[:, :, None]).astype(np.uint8)
+
+
+def draw_status_chip(
+    frame: np.ndarray,
+    text: str,
+    origin: tuple[int, int],
+    active: bool,
+    accent: tuple[int, int, int] = COLOR_ACCENT,
+) -> int:
+    x, y = origin
+    width = max(92, 14 + len(text) * 10)
+    color = accent if active else COLOR_PANEL_2
+    blend_rect(frame, (x, y), (x + width, y + 28), color, 0.72 if active else 0.82)
+    cv2.rectangle(frame, (x, y), (x + width, y + 28), color, 1, cv2.LINE_AA)
+    put_text(frame, text, (x + 11, y + 19), 0.46, COLOR_TEXT)
+    return width
+
+
+def draw_progress_bar(
+    frame: np.ndarray,
+    label: str,
+    value: float,
+    origin: tuple[int, int],
+    width: int,
+    accent: tuple[int, int, int],
+) -> None:
+    x, y = origin
+    value = float(np.clip(value, 0.0, 1.0))
+    put_text(frame, label, (x, y), 0.44, COLOR_MUTED)
+    cv2.rectangle(frame, (x, y + 10), (x + width, y + 20), (64, 70, 82), -1)
+    cv2.rectangle(frame, (x, y + 10), (x + int(width * value), y + 20), accent, -1)
+    cv2.rectangle(frame, (x, y + 10), (x + width, y + 20), (92, 100, 112), 1, cv2.LINE_AA)
+
+
+def draw_gaze_pad(
+    frame: np.ndarray,
+    result: FrameResult,
+    estimator: GazeEstimator,
+    origin: tuple[int, int],
+    size: int,
+) -> None:
+    x, y = origin
+    blend_rect(frame, (x, y), (x + size, y + size), COLOR_PANEL_2, 0.82)
+    cv2.rectangle(frame, (x, y), (x + size, y + size), (80, 90, 104), 1, cv2.LINE_AA)
+    cv2.line(frame, (x + size // 2, y + 12), (x + size // 2, y + size - 12), (70, 78, 90), 1)
+    cv2.line(frame, (x + 12, y + size // 2), (x + size - 12, y + size // 2), (70, 78, 90), 1)
+
+    center_x = x + int(estimator.center_x * size)
+    center_y = y + int(estimator.center_y * size)
+    cv2.circle(frame, (center_x, center_y), 5, COLOR_BLUE, 1, cv2.LINE_AA)
+
+    if result.ratio_x is None or result.ratio_y is None:
+        put_text(frame, "no face", (x + 18, y + size // 2 + 5), 0.5, COLOR_MUTED)
+        return
+
+    gaze_x = x + int(result.ratio_x * size)
+    gaze_y = y + int(result.ratio_y * size)
+    cv2.circle(frame, (gaze_x, gaze_y), 10, COLOR_ACCENT, -1, cv2.LINE_AA)
+    cv2.circle(frame, (gaze_x, gaze_y), 16, COLOR_ACCENT, 1, cv2.LINE_AA)
 
 
 def draw_hud(
@@ -329,36 +449,68 @@ def draw_hud(
     log_enabled: bool,
     cursor_status: str,
 ) -> None:
-    lines = [
-        f"Gaze: {result.stable_direction}  raw: {result.raw_direction}",
-        f"Eyes: {result.eyes_found}  Center: {estimator.center_x:.2f}, {estimator.center_y:.2f}",
-        f"Detector: MediaPipe Face Landmarker  Log: {'on' if log_enabled else 'off'}  Cursor: {cursor_status}",
-        "C - calibrate | M - cursor | Q - exit",
-    ]
+    height, width = frame.shape[:2]
+    margin = 16
+    top_h = 76
+    bottom_h = 48
 
-    y = 34
-    for line in lines:
-        cv2.putText(
-            frame,
-            line,
-            (18, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.62,
-            (20, 20, 20),
-            4,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            line,
-            (18, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.62,
-            (40, 240, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        y += 28
+    apply_vignette(frame)
+    blend_rect(frame, (0, 0), (width, top_h), COLOR_PANEL, 0.78)
+    blend_rect(frame, (0, height - bottom_h), (width, height), COLOR_PANEL, 0.78)
+
+    put_text(frame, "Gaze Studio", (margin, 29), 0.72, COLOR_TEXT, 2)
+    put_text(frame, "MediaPipe Face Landmarker", (margin, 56), 0.46, COLOR_MUTED)
+
+    chips = [
+        (f"cursor {cursor_status}", cursor_status == "on", COLOR_ACCENT),
+        ("log on" if log_enabled else "log off", log_enabled, COLOR_BLUE),
+        (f"eyes {result.eyes_found}", result.eyes_found > 0, COLOR_WARN),
+    ]
+    chip_widths = [max(92, 14 + len(text) * 10) for text, _, _ in chips]
+    chip_x = max(margin, width - margin - sum(chip_widths) - 8 * (len(chips) - 1))
+    for index, (text, active, accent) in enumerate(chips):
+        chip_x += draw_status_chip(frame, text, (chip_x, 22), active, accent)
+        if index < len(chips) - 1:
+            chip_x += 8
+
+    panel_w = min(310, max(240, width // 3))
+    panel_h = 206
+    panel_x = margin
+    panel_y = top_h + 16
+    blend_rect(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), COLOR_PANEL, 0.72)
+    cv2.rectangle(
+        frame,
+        (panel_x, panel_y),
+        (panel_x + panel_w, panel_y + panel_h),
+        (68, 78, 92),
+        1,
+        cv2.LINE_AA,
+    )
+
+    direction = result.stable_direction.upper().replace("-", " ")
+    direction_color = COLOR_DANGER if result.stable_direction == "unknown" else COLOR_ACCENT
+    put_text(frame, "CURRENT GAZE", (panel_x + 18, panel_y + 28), 0.43, COLOR_MUTED)
+    put_text(frame, direction, (panel_x + 18, panel_y + 64), 0.86, direction_color, 2)
+    put_text(frame, f"raw: {result.raw_direction}", (panel_x + 18, panel_y + 91), 0.45, COLOR_MUTED)
+
+    draw_progress_bar(
+        frame,
+        "confidence",
+        result.confidence,
+        (panel_x + 18, panel_y + 124),
+        panel_w - 36,
+        COLOR_ACCENT if result.confidence >= 0.5 else COLOR_DANGER,
+    )
+    ratio_text = "x --  y --"
+    if result.ratio_x is not None and result.ratio_y is not None:
+        ratio_text = f"x {result.ratio_x:.2f}  y {result.ratio_y:.2f}"
+    put_text(frame, ratio_text, (panel_x + 18, panel_y + 176), 0.5, COLOR_TEXT)
+
+    pad_size = 132
+    draw_gaze_pad(frame, result, estimator, (width - pad_size - margin, top_h + 16), pad_size)
+
+    footer = "C  calibrate    M  cursor toggle    Q  quit"
+    put_text(frame, footer, (margin, height - 18), 0.52, COLOR_TEXT)
 
 
 def process_frame(
@@ -392,7 +544,7 @@ def process_frame(
             gaze_results.append(result)
             draw_landmark_eye(frame, eye_points, result)
 
-    ratio_x, ratio_y = average_gaze(gaze_results)
+    ratio_x, ratio_y, confidence = average_gaze(gaze_results)
     raw_direction = estimator.classify(ratio_x, ratio_y)
     stable_direction = estimator.smooth(raw_direction)
 
@@ -402,6 +554,7 @@ def process_frame(
         stable_direction=stable_direction,
         ratio_x=ratio_x,
         ratio_y=ratio_y,
+        confidence=confidence,
         eyes_found=len(gaze_results),
     )
     draw_hud(frame, result, estimator, log_enabled, cursor_status)
@@ -425,6 +578,10 @@ def run(
             f"Cannot open camera #{camera_index}. Try another index with --camera."
         )
 
+    window_name = "Gaze Studio"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 960, 720)
+
     try:
         while True:
             ok, frame = camera.read()
@@ -440,7 +597,7 @@ def run(
             )
             logger.write(result)
             cursor.move(result.stable_direction)
-            cv2.imshow("Simple Eye Tracking", result.frame)
+            cv2.imshow(window_name, result.frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
@@ -473,7 +630,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--control-cursor",
         action="store_true",
-        help="Enable gaze-based cursor control. Press M in the video window to toggle it.",
+        help="Start with gaze-based cursor control enabled. Press M in the video window to toggle it.",
     )
     parser.add_argument(
         "--cursor-speed",
