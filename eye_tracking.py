@@ -211,12 +211,13 @@ class CursorController:
         self.user32 = ctypes.windll.user32 if self.available else None
         self.current_x: float | None = None
         self.current_y: float | None = None
+        self.gaze_x: float | None = None
+        self.gaze_y: float | None = None
 
     def toggle(self) -> None:
         if self.available:
             self.active = not self.active
-            self.current_x = None
-            self.current_y = None
+            self.reset_motion()
 
     def status(self) -> str:
         if not self.available:
@@ -244,12 +245,13 @@ class CursorController:
 
     def set_mapper(self, mapper: ScreenMapper) -> None:
         self.mapper = mapper
-        self.current_x = None
-        self.current_y = None
+        self.reset_motion()
 
     def reset_motion(self) -> None:
         self.current_x = None
         self.current_y = None
+        self.gaze_x = None
+        self.gaze_y = None
 
     def move(
         self,
@@ -263,20 +265,28 @@ class CursorController:
             self.reset_motion()
             return
 
+        gaze_alpha = 0.82
+        if self.gaze_x is None or self.gaze_y is None:
+            self.gaze_x = ratio_x
+            self.gaze_y = ratio_y
+        else:
+            self.gaze_x = self.gaze_x * gaze_alpha + ratio_x * (1.0 - gaze_alpha)
+            self.gaze_y = self.gaze_y * gaze_alpha + ratio_y * (1.0 - gaze_alpha)
+
         point = ctypes.wintypes.POINT()
         self.user32.GetCursorPos(ctypes.byref(point))
         screen_w = self.user32.GetSystemMetrics(0)
         screen_h = self.user32.GetSystemMetrics(1)
-        target_x, target_y = self.mapper.map(ratio_x, ratio_y, screen_w, screen_h)
+        target_x, target_y = self.mapper.map(self.gaze_x, self.gaze_y, screen_w, screen_h)
 
-        alpha = float(np.clip(self.smoothing, 0.0, 0.95))
+        alpha = float(np.clip(self.smoothing, 0.0, 0.98))
         if self.current_x is None or self.current_y is None:
             self.current_x = float(point.x)
             self.current_y = float(point.y)
 
         self.current_x = self.current_x * alpha + target_x * (1.0 - alpha)
         self.current_y = self.current_y * alpha + target_y * (1.0 - alpha)
-        self.user32.SetCursorPos(int(self.current_x), int(self.current_y))
+        self.user32.SetCursorPos(int(round(self.current_x)), int(round(self.current_y)))
 
 
 def landmark_to_point(landmark, frame_width: int, frame_height: int) -> tuple[int, int]:
@@ -304,10 +314,19 @@ def get_screen_size() -> tuple[int, int]:
 
 
 class CalibrationSession:
-    def __init__(self, screen_w: int, screen_h: int, samples_per_point: int) -> None:
+    def __init__(
+        self,
+        screen_w: int,
+        screen_h: int,
+        samples_per_point: int,
+        settle_frames: int = 18,
+        sample_stride: int = 2,
+    ) -> None:
         self.screen_w = screen_w
         self.screen_h = screen_h
         self.samples_per_point = samples_per_point
+        self.settle_frames = settle_frames
+        self.sample_stride = sample_stride
         self.targets = [
             (0.5, 0.5),
             (0.15, 0.15),
@@ -323,12 +342,14 @@ class CalibrationSession:
         self.target_index = 0
         self.samples: list[tuple[float, float, int, int]] = []
         self.point_samples = 0
+        self.point_frames = 0
 
     def start(self) -> None:
         self.active = True
         self.target_index = 0
         self.samples.clear()
         self.point_samples = 0
+        self.point_frames = 0
 
     def stop(self) -> None:
         self.active = False
@@ -340,12 +361,26 @@ class CalibrationSession:
     def progress_label(self) -> str:
         if not self.active:
             return "inactive"
-        return f"{self.target_index + 1}/{len(self.targets)} sample {self.point_samples}/{self.samples_per_point}"
+        return (
+            f"step {self.target_index + 1}/{len(self.targets)} "
+            f"sample {self.point_samples}/{self.samples_per_point}"
+        )
+
+    def ready_for_sample(self) -> bool:
+        return self.point_frames >= self.settle_frames
 
     def add_sample(self, ratio_x: float | None, ratio_y: float | None, confidence: float) -> bool:
         if not self.active or ratio_x is None or ratio_y is None:
+            self.point_frames += 1
             return False
         if confidence < 0.35:
+            self.point_frames += 1
+            return False
+
+        self.point_frames += 1
+        if not self.ready_for_sample():
+            return False
+        if (self.point_frames - self.settle_frames) % self.sample_stride != 0:
             return False
 
         screen_x, screen_y = self.current_target()
@@ -354,6 +389,7 @@ class CalibrationSession:
         if self.point_samples >= self.samples_per_point:
             self.point_samples = 0
             self.target_index += 1
+            self.point_frames = 0
             if self.target_index >= len(self.targets):
                 self.active = False
                 return True
@@ -362,15 +398,38 @@ class CalibrationSession:
     def render(self) -> np.ndarray:
         frame = np.zeros((self.screen_h, self.screen_w, 3), dtype=np.uint8)
         put_text(frame, "Calibration", (40, 60), 1.0, COLOR_TEXT, 2)
-        put_text(frame, "Look at the target and hold still", (40, 102), 0.75, COLOR_MUTED, 2)
+        put_text(frame, "Look at the target and hold still", (40, 102), 0.78, COLOR_MUTED, 2)
         put_text(frame, self.progress_label(), (40, 138), 0.75, COLOR_ACCENT, 2)
+        put_text(
+            frame,
+            "Wait for the target to stabilize, then keep your eyes on it",
+            (40, 176),
+            0.66,
+            COLOR_MUTED,
+            2,
+        )
 
         if self.active:
             target_x, target_y = self.current_target()
-            cv2.line(frame, (target_x - 32, target_y), (target_x + 32, target_y), COLOR_ACCENT, 2, cv2.LINE_AA)
-            cv2.line(frame, (target_x, target_y - 32), (target_x, target_y + 32), COLOR_ACCENT, 2, cv2.LINE_AA)
+            marker_color = COLOR_ACCENT if self.ready_for_sample() else COLOR_WARN
+            radius = 46 if self.ready_for_sample() else 36
+            cv2.circle(frame, (target_x, target_y), radius, marker_color, 3, cv2.LINE_AA)
             cv2.circle(frame, (target_x, target_y), 14, COLOR_TEXT, 2, cv2.LINE_AA)
             cv2.circle(frame, (target_x, target_y), 5, COLOR_TEXT, -1, cv2.LINE_AA)
+
+            bar_x = 40
+            bar_y = 220
+            bar_w = min(720, self.screen_w - 80)
+            fill = float(np.clip(self.point_frames / max(1, self.settle_frames), 0.0, 1.0))
+            draw_progress_bar(frame, "settle", fill, (bar_x, bar_y), bar_w, marker_color)
+            draw_progress_bar(
+                frame,
+                "samples",
+                self.point_samples / max(1, self.samples_per_point),
+                (bar_x, bar_y + 46),
+                bar_w,
+                COLOR_BLUE,
+            )
 
         put_text(frame, "Press Q to abort calibration", (40, self.screen_h - 40), 0.7, COLOR_MUTED, 2)
         return frame
@@ -838,7 +897,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cursor-smoothing",
         type=float,
-        default=0.68,
+        default=0.84,
         help="Cursor position smoothing from 0.0 to 0.95. Higher is smoother.",
     )
     parser.add_argument(
@@ -850,7 +909,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--calibration-samples",
         type=int,
-        default=10,
+        default=14,
         help="Number of stable gaze samples to collect per calibration point.",
     )
     return parser.parse_args()
