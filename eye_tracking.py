@@ -159,46 +159,124 @@ class CsvLogger:
             self.file.close()
 
 
+class ScreenMapper:
+    def __init__(self, coeffs_x: np.ndarray, coeffs_y: np.ndarray) -> None:
+        self.coeffs_x = coeffs_x
+        self.coeffs_y = coeffs_y
+
+    @staticmethod
+    def features(gaze_x: float, gaze_y: float) -> np.ndarray:
+        return np.array(
+            [1.0, gaze_x, gaze_y, gaze_x * gaze_y, gaze_x * gaze_x, gaze_y * gaze_y],
+            dtype=np.float32,
+        )
+
+    def map(self, gaze_x: float, gaze_y: float, screen_w: int, screen_h: int) -> tuple[int, int]:
+        vector = self.features(gaze_x, gaze_y)
+        x = float(np.dot(self.coeffs_x, vector))
+        y = float(np.dot(self.coeffs_y, vector))
+        return (
+            int(np.clip(x, 0, screen_w - 1)),
+            int(np.clip(y, 0, screen_h - 1)),
+        )
+
+    @classmethod
+    def fit(
+        cls,
+        samples: list[tuple[float, float, int, int]],
+    ) -> "ScreenMapper":
+        matrix = np.array(
+            [cls.features(gaze_x, gaze_y) for gaze_x, gaze_y, _, _ in samples],
+            dtype=np.float32,
+        )
+        targets_x = np.array([screen_x for _, _, screen_x, _ in samples], dtype=np.float32)
+        targets_y = np.array([screen_y for _, _, _, screen_y in samples], dtype=np.float32)
+        coeffs_x, *_ = np.linalg.lstsq(matrix, targets_x, rcond=None)
+        coeffs_y, *_ = np.linalg.lstsq(matrix, targets_y, rcond=None)
+        return cls(coeffs_x, coeffs_y)
+
+
 class CursorController:
-    def __init__(self, active_by_default: bool, speed: int) -> None:
+    def __init__(
+        self,
+        active_by_default: bool,
+        smoothing: float,
+        min_confidence: float,
+    ) -> None:
         self.available = hasattr(ctypes, "windll")
         self.active = active_by_default and self.available
-        self.speed = speed
+        self.smoothing = smoothing
+        self.min_confidence = min_confidence
+        self.mapper: ScreenMapper | None = None
         self.user32 = ctypes.windll.user32 if self.available else None
+        self.current_x: float | None = None
+        self.current_y: float | None = None
 
     def toggle(self) -> None:
         if self.available:
             self.active = not self.active
+            self.current_x = None
+            self.current_y = None
 
     def status(self) -> str:
         if not self.available:
             return "unavailable"
+        if self.mapper is None:
+            return "unmapped"
         return "on" if self.active else "off"
 
-    def move(self, direction: str) -> None:
-        if not self.available or not self.active or direction in ("center", "unknown"):
+    def movement_status(self, result: FrameResult, calibration_active: bool) -> str:
+        if calibration_active:
+            return "calibrating"
+        if not self.available:
+            return "unavailable"
+        if not self.active:
+            return "paused"
+        if self.mapper is None:
+            return "need calibration"
+        if result.ratio_x is None or result.ratio_y is None:
+            return "no gaze"
+        if result.confidence < self.min_confidence:
+            return "low confidence"
+        if self.current_x is None or self.current_y is None:
+            return "tracking"
+        return f"{int(self.current_x)}, {int(self.current_y)}"
+
+    def set_mapper(self, mapper: ScreenMapper) -> None:
+        self.mapper = mapper
+        self.current_x = None
+        self.current_y = None
+
+    def reset_motion(self) -> None:
+        self.current_x = None
+        self.current_y = None
+
+    def move(
+        self,
+        ratio_x: float | None,
+        ratio_y: float | None,
+        confidence: float,
+    ) -> None:
+        if not self.available or not self.active or self.mapper is None:
             return
-
-        dx = 0
-        dy = 0
-        step = self.speed
-
-        if "left" in direction:
-            dx = -step
-        if "right" in direction:
-            dx = step
-        if "up" in direction:
-            dy = -step
-        if "down" in direction:
-            dy = step
+        if ratio_x is None or ratio_y is None or confidence < self.min_confidence:
+            self.reset_motion()
+            return
 
         point = ctypes.wintypes.POINT()
         self.user32.GetCursorPos(ctypes.byref(point))
         screen_w = self.user32.GetSystemMetrics(0)
         screen_h = self.user32.GetSystemMetrics(1)
-        new_x = int(np.clip(point.x + dx, 0, screen_w - 1))
-        new_y = int(np.clip(point.y + dy, 0, screen_h - 1))
-        self.user32.SetCursorPos(new_x, new_y)
+        target_x, target_y = self.mapper.map(ratio_x, ratio_y, screen_w, screen_h)
+
+        alpha = float(np.clip(self.smoothing, 0.0, 0.95))
+        if self.current_x is None or self.current_y is None:
+            self.current_x = float(point.x)
+            self.current_y = float(point.y)
+
+        self.current_x = self.current_x * alpha + target_x * (1.0 - alpha)
+        self.current_y = self.current_y * alpha + target_y * (1.0 - alpha)
+        self.user32.SetCursorPos(int(self.current_x), int(self.current_y))
 
 
 def landmark_to_point(landmark, frame_width: int, frame_height: int) -> tuple[int, int]:
@@ -216,6 +294,91 @@ def landmark_points(
         for index in indexes
         if index < len(landmarks)
     ]
+
+
+def get_screen_size() -> tuple[int, int]:
+    if hasattr(ctypes, "windll"):
+        user32 = ctypes.windll.user32
+        return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+    return 1920, 1080
+
+
+class CalibrationSession:
+    def __init__(self, screen_w: int, screen_h: int, samples_per_point: int) -> None:
+        self.screen_w = screen_w
+        self.screen_h = screen_h
+        self.samples_per_point = samples_per_point
+        self.targets = [
+            (0.5, 0.5),
+            (0.15, 0.15),
+            (0.85, 0.15),
+            (0.85, 0.85),
+            (0.15, 0.85),
+            (0.5, 0.15),
+            (0.5, 0.85),
+            (0.15, 0.5),
+            (0.85, 0.5),
+        ]
+        self.active = False
+        self.target_index = 0
+        self.samples: list[tuple[float, float, int, int]] = []
+        self.point_samples = 0
+
+    def start(self) -> None:
+        self.active = True
+        self.target_index = 0
+        self.samples.clear()
+        self.point_samples = 0
+
+    def stop(self) -> None:
+        self.active = False
+
+    def current_target(self) -> tuple[int, int]:
+        ratio_x, ratio_y = self.targets[self.target_index]
+        return int(ratio_x * self.screen_w), int(ratio_y * self.screen_h)
+
+    def progress_label(self) -> str:
+        if not self.active:
+            return "inactive"
+        return f"{self.target_index + 1}/{len(self.targets)} sample {self.point_samples}/{self.samples_per_point}"
+
+    def add_sample(self, ratio_x: float | None, ratio_y: float | None, confidence: float) -> bool:
+        if not self.active or ratio_x is None or ratio_y is None:
+            return False
+        if confidence < 0.35:
+            return False
+
+        screen_x, screen_y = self.current_target()
+        self.samples.append((ratio_x, ratio_y, screen_x, screen_y))
+        self.point_samples += 1
+        if self.point_samples >= self.samples_per_point:
+            self.point_samples = 0
+            self.target_index += 1
+            if self.target_index >= len(self.targets):
+                self.active = False
+                return True
+        return False
+
+    def render(self) -> np.ndarray:
+        frame = np.zeros((self.screen_h, self.screen_w, 3), dtype=np.uint8)
+        put_text(frame, "Calibration", (40, 60), 1.0, COLOR_TEXT, 2)
+        put_text(frame, "Look at the target and hold still", (40, 102), 0.75, COLOR_MUTED, 2)
+        put_text(frame, self.progress_label(), (40, 138), 0.75, COLOR_ACCENT, 2)
+
+        if self.active:
+            target_x, target_y = self.current_target()
+            cv2.line(frame, (target_x - 32, target_y), (target_x + 32, target_y), COLOR_ACCENT, 2, cv2.LINE_AA)
+            cv2.line(frame, (target_x, target_y - 32), (target_x, target_y + 32), COLOR_ACCENT, 2, cv2.LINE_AA)
+            cv2.circle(frame, (target_x, target_y), 14, COLOR_TEXT, 2, cv2.LINE_AA)
+            cv2.circle(frame, (target_x, target_y), 5, COLOR_TEXT, -1, cv2.LINE_AA)
+
+        put_text(frame, "Press Q to abort calibration", (40, self.screen_h - 40), 0.7, COLOR_MUTED, 2)
+        return frame
+
+    def build_mapper(self) -> ScreenMapper:
+        if len(self.samples) < 12:
+            raise RuntimeError("Not enough calibration samples collected.")
+        return ScreenMapper.fit(self.samples)
 
 
 def ensure_face_landmarker_model() -> Path:
@@ -448,6 +611,9 @@ def draw_hud(
     estimator: GazeEstimator,
     log_enabled: bool,
     cursor_status: str,
+    cursor_motion: str,
+    cursor_hint: str,
+    calibration_status: str,
 ) -> None:
     height, width = frame.shape[:2]
     margin = 16
@@ -474,7 +640,7 @@ def draw_hud(
             chip_x += 8
 
     panel_w = min(310, max(240, width // 3))
-    panel_h = 206
+    panel_h = 232
     panel_x = margin
     panel_y = top_h + 16
     blend_rect(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), COLOR_PANEL, 0.72)
@@ -504,12 +670,15 @@ def draw_hud(
     ratio_text = "x --  y --"
     if result.ratio_x is not None and result.ratio_y is not None:
         ratio_text = f"x {result.ratio_x:.2f}  y {result.ratio_y:.2f}"
-    put_text(frame, ratio_text, (panel_x + 18, panel_y + 176), 0.5, COLOR_TEXT)
+    put_text(frame, ratio_text, (panel_x + 18, panel_y + 170), 0.5, COLOR_TEXT)
+    put_text(frame, cursor_motion, (panel_x + 18, panel_y + 194), 0.42, COLOR_MUTED)
 
     pad_size = 132
     draw_gaze_pad(frame, result, estimator, (width - pad_size - margin, top_h + 16), pad_size)
 
-    footer = "C  calibrate    M  cursor toggle    Q  quit"
+    put_text(frame, f"calibration: {calibration_status}", (panel_x + 18, panel_y + 216), 0.42, COLOR_MUTED)
+
+    footer = f"C  calibrate screen    M  cursor toggle    R  reset    Q  quit    {cursor_hint}"
     put_text(frame, footer, (margin, height - 18), 0.52, COLOR_TEXT)
 
 
@@ -517,8 +686,6 @@ def process_frame(
     frame: np.ndarray,
     face_landmarker,
     estimator: GazeEstimator,
-    log_enabled: bool,
-    cursor_status: str,
 ) -> FrameResult:
     frame = cv2.flip(frame, 1)
     frame_height, frame_width = frame.shape[:2]
@@ -557,7 +724,6 @@ def process_frame(
         confidence=confidence,
         eyes_found=len(gaze_results),
     )
-    draw_hud(frame, result, estimator, log_enabled, cursor_status)
     return result
 
 
@@ -565,12 +731,20 @@ def run(
     camera_index: int,
     log_path: Path | None,
     control_cursor: bool,
-    cursor_speed: int,
+    cursor_smoothing: float,
+    cursor_min_confidence: float,
+    calibration_samples: int,
 ) -> None:
     estimator = GazeEstimator()
     logger = CsvLogger(log_path)
-    cursor = CursorController(control_cursor, cursor_speed)
+    cursor = CursorController(
+        active_by_default=control_cursor,
+        smoothing=cursor_smoothing,
+        min_confidence=cursor_min_confidence,
+    )
     face_landmarker = create_face_landmarker()
+    screen_w, screen_h = get_screen_size()
+    calibration = CalibrationSession(screen_w, screen_h, calibration_samples)
 
     camera = cv2.VideoCapture(camera_index)
     if not camera.isOpened():
@@ -579,8 +753,10 @@ def run(
         )
 
     window_name = "Gaze Studio"
+    calibration_window = "Calibration"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 960, 720)
+    cursor_hint = f"sm {cursor_smoothing:.2f}  conf {cursor_min_confidence:.2f}"
 
     try:
         while True:
@@ -588,24 +764,51 @@ def run(
             if not ok:
                 raise RuntimeError("Cannot read frame from camera.")
 
-            result = process_frame(
-                frame,
-                face_landmarker,
+            result = process_frame(frame, face_landmarker, estimator)
+            logger.write(result)
+
+            if calibration.active:
+                done = calibration.add_sample(result.ratio_x, result.ratio_y, result.confidence)
+                cv2.namedWindow(calibration_window, cv2.WINDOW_NORMAL)
+                cv2.setWindowProperty(calibration_window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                cv2.imshow(calibration_window, calibration.render())
+                cursor.reset_motion()
+                if done:
+                    cursor.set_mapper(calibration.build_mapper())
+                    cursor.active = True
+                    calibration.stop()
+                    cv2.destroyWindow(calibration_window)
+            else:
+                cursor.move(result.ratio_x, result.ratio_y, result.confidence)
+
+            draw_hud(
+                result.frame,
+                result,
                 estimator,
                 log_path is not None,
                 cursor.status(),
+                cursor.movement_status(result, calibration.active),
+                cursor_hint,
+                calibration.progress_label(),
             )
-            logger.write(result)
-            cursor.move(result.stable_direction)
             cv2.imshow(window_name, result.frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             if key == ord("c"):
-                estimator.calibrate(result.ratio_x, result.ratio_y)
+                if not calibration.active:
+                    calibration.start()
             if key == ord("m"):
                 cursor.toggle()
+            if key == ord("r"):
+                calibration.stop()
+                cursor.mapper = None
+                cursor.reset_motion()
+                try:
+                    cv2.destroyWindow(calibration_window)
+                except cv2.error:
+                    pass
     finally:
         face_landmarker.close()
         logger.close()
@@ -630,13 +833,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--control-cursor",
         action="store_true",
-        help="Start with gaze-based cursor control enabled. Press M in the video window to toggle it.",
+        help="Start with gaze-based cursor control enabled after calibration. Press M in the video window to toggle it.",
     )
     parser.add_argument(
-        "--cursor-speed",
+        "--cursor-smoothing",
+        type=float,
+        default=0.68,
+        help="Cursor position smoothing from 0.0 to 0.95. Higher is smoother.",
+    )
+    parser.add_argument(
+        "--cursor-min-confidence",
+        type=float,
+        default=0.30,
+        help="Minimum gaze confidence required to move the cursor.",
+    )
+    parser.add_argument(
+        "--calibration-samples",
         type=int,
-        default=18,
-        help="Cursor movement step in pixels per frame.",
+        default=10,
+        help="Number of stable gaze samples to collect per calibration point.",
     )
     return parser.parse_args()
 
@@ -647,5 +862,7 @@ if __name__ == "__main__":
         camera_index=args.camera,
         log_path=args.log,
         control_cursor=args.control_cursor,
-        cursor_speed=max(1, args.cursor_speed),
+        cursor_smoothing=float(np.clip(args.cursor_smoothing, 0.0, 0.95)),
+        cursor_min_confidence=float(np.clip(args.cursor_min_confidence, 0.0, 1.0)),
+        calibration_samples=max(4, args.calibration_samples),
     )
