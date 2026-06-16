@@ -2,13 +2,26 @@ import argparse
 import ctypes
 import ctypes.wintypes
 import csv
+import os
 import time
+import urllib.request
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+MATPLOTLIB_CACHE_DIR = Path(".cache/matplotlib").resolve()
+MATPLOTLIB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(MATPLOTLIB_CACHE_DIR))
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+try:
+    import mediapipe as mp
+except ImportError:
+    mp = None
 
 
 @dataclass
@@ -28,6 +41,23 @@ class FrameResult:
     ratio_x: float | None
     ratio_y: float | None
     eyes_found: int
+
+
+LEFT_EYE_CONTOUR = [
+    33, 246, 161, 160, 159, 158, 157, 173,
+    133, 155, 154, 153, 145, 144, 163, 7,
+]
+RIGHT_EYE_CONTOUR = [
+    362, 398, 384, 385, 386, 387, 388, 466,
+    263, 249, 390, 373, 374, 380, 381, 382,
+]
+LEFT_IRIS = [468, 469, 470, 471, 472]
+RIGHT_IRIS = [473, 474, 475, 476, 477]
+FACE_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/latest/face_landmarker.task"
+)
+FACE_LANDMARKER_MODEL_PATH = Path(".cache/mediapipe/face_landmarker.task")
 
 
 class GazeEstimator:
@@ -160,67 +190,125 @@ class CursorController:
         self.user32.SetCursorPos(new_x, new_y)
 
 
-def load_cascade(name: str) -> cv2.CascadeClassifier:
-    path = cv2.data.haarcascades + name
-    cascade = cv2.CascadeClassifier(path)
-    if cascade.empty():
-        raise RuntimeError(f"Cannot load cascade: {path}")
-    return cascade
+def landmark_to_point(landmark, frame_width: int, frame_height: int) -> tuple[int, int]:
+    return int(landmark.x * frame_width), int(landmark.y * frame_height)
 
 
-def detect_pupil(eye_gray: np.ndarray, threshold_offset: int = 0) -> GazeResult:
-    blurred = cv2.GaussianBlur(eye_gray, (7, 7), 0)
-    otsu_value, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    threshold_value = int(np.clip(otsu_value + threshold_offset, 5, 250))
-    _, threshold = cv2.threshold(blurred, threshold_value, 255, cv2.THRESH_BINARY_INV)
-
-    kernel = np.ones((3, 3), np.uint8)
-    threshold = cv2.morphologyEx(threshold, cv2.MORPH_OPEN, kernel, iterations=1)
-    threshold = cv2.morphologyEx(threshold, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(
-        threshold, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    if not contours:
-        return GazeResult("unknown", None, None, None, 0.0)
-
-    height, width = eye_gray.shape[:2]
-    eye_area = width * height
-    min_area = max(8, int(eye_area * 0.01))
-    max_area = int(eye_area * 0.45)
-    candidates = [
-        cnt for cnt in contours if min_area <= cv2.contourArea(cnt) <= max_area
+def landmark_points(
+    landmarks,
+    indexes: list[int],
+    frame_width: int,
+    frame_height: int,
+) -> list[tuple[int, int]]:
+    return [
+        landmark_to_point(landmarks[index], frame_width, frame_height)
+        for index in indexes
+        if index < len(landmarks)
     ]
 
-    if not candidates:
-        return GazeResult("unknown", None, None, None, 0.0)
 
-    pupil = max(candidates, key=cv2.contourArea)
-    moments = cv2.moments(pupil)
-    if moments["m00"] == 0:
-        return GazeResult("unknown", None, None, None, 0.0)
+def ensure_face_landmarker_model() -> Path:
+    if FACE_LANDMARKER_MODEL_PATH.exists():
+        return FACE_LANDMARKER_MODEL_PATH
 
-    center_x = int(moments["m10"] / moments["m00"])
-    center_y = int(moments["m01"] / moments["m00"])
-    ratio_x = center_x / max(1, width)
-    ratio_y = center_y / max(1, height)
-    confidence = min(1.0, cv2.contourArea(pupil) / max(1, eye_area * 0.12))
+    FACE_LANDMARKER_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        urllib.request.urlretrieve(
+            FACE_LANDMARKER_MODEL_URL,
+            FACE_LANDMARKER_MODEL_PATH,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            "Cannot download MediaPipe Face Landmarker model. "
+            f"Download it manually from {FACE_LANDMARKER_MODEL_URL} and save it to "
+            f"{FACE_LANDMARKER_MODEL_PATH}."
+        ) from exc
 
-    return GazeResult("detected", (center_x, center_y), ratio_x, ratio_y, confidence)
+    return FACE_LANDMARKER_MODEL_PATH
 
 
-def draw_eye_result(frame: np.ndarray, eye_box: tuple[int, int, int, int], result: GazeResult) -> None:
-    x, y, width, height = eye_box
-    color = (80, 220, 120) if result.pupil_center else (90, 90, 255)
-    cv2.rectangle(frame, (x, y), (x + width, y + height), color, 2)
+def create_face_landmarker():
+    if mp is None:
+        raise RuntimeError(
+            "MediaPipe is not installed. Use Python 3.10-3.12, then run "
+            "`pip install -r requirements.txt`."
+        )
 
-    if result.pupil_center is None:
-        return
+    model_path = ensure_face_landmarker_model()
+    options = mp.tasks.vision.FaceLandmarkerOptions(
+        base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
+        running_mode=mp.tasks.vision.RunningMode.IMAGE,
+        num_faces=1,
+        min_face_detection_confidence=0.55,
+        min_face_presence_confidence=0.55,
+        min_tracking_confidence=0.55,
+    )
+    return mp.tasks.vision.FaceLandmarker.create_from_options(options)
 
-    pupil_x = x + result.pupil_center[0]
-    pupil_y = y + result.pupil_center[1]
-    cv2.circle(frame, (pupil_x, pupil_y), 4, (0, 0, 255), -1)
+
+def estimate_eye_from_landmarks(
+    landmarks,
+    eye_indexes: list[int],
+    iris_indexes: list[int],
+    frame_width: int,
+    frame_height: int,
+) -> tuple[GazeResult, list[tuple[int, int]]]:
+    eye_points = landmark_points(landmarks, eye_indexes, frame_width, frame_height)
+    iris_points = landmark_points(landmarks, iris_indexes, frame_width, frame_height)
+
+    if len(eye_points) < 4 or not iris_points:
+        return GazeResult("unknown", None, None, None, 0.0), eye_points
+
+    eye_array = np.array(eye_points, dtype=np.int32)
+    iris_array = np.array(iris_points, dtype=np.float32)
+    min_x = int(np.min(eye_array[:, 0]))
+    max_x = int(np.max(eye_array[:, 0]))
+    min_y = int(np.min(eye_array[:, 1]))
+    max_y = int(np.max(eye_array[:, 1]))
+
+    width = max(1, max_x - min_x)
+    height = max(1, max_y - min_y)
+    center_x = float(np.mean(iris_array[:, 0]))
+    center_y = float(np.mean(iris_array[:, 1]))
+    ratio_x = float(np.clip((center_x - min_x) / width, 0.0, 1.0))
+    ratio_y = float(np.clip((center_y - min_y) / height, 0.0, 1.0))
+
+    iris_center = np.mean(iris_array, axis=0)
+    iris_spread = float(np.mean(np.linalg.norm(iris_array - iris_center, axis=1)))
+    confidence = float(
+        np.clip(iris_spread / max(1.0, min(width, height) * 0.18), 0.35, 1.0)
+    )
+
+    return (
+        GazeResult(
+            "detected",
+            (int(center_x), int(center_y)),
+            ratio_x,
+            ratio_y,
+            confidence,
+        ),
+        eye_points,
+    )
+
+
+def draw_landmark_eye(
+    frame: np.ndarray,
+    eye_points: list[tuple[int, int]],
+    result: GazeResult,
+) -> None:
+    if len(eye_points) >= 3:
+        cv2.polylines(
+            frame,
+            [np.array(eye_points, dtype=np.int32)],
+            isClosed=True,
+            color=(80, 220, 120),
+            thickness=1,
+            lineType=cv2.LINE_AA,
+        )
+
+    if result.pupil_center is not None:
+        cv2.circle(frame, result.pupil_center, 4, (0, 0, 255), -1)
+        cv2.circle(frame, result.pupil_center, 8, (40, 240, 255), 1, cv2.LINE_AA)
 
 
 def average_gaze(results: list[GazeResult]) -> tuple[float | None, float | None]:
@@ -238,15 +326,14 @@ def draw_hud(
     frame: np.ndarray,
     result: FrameResult,
     estimator: GazeEstimator,
-    threshold_offset: int,
     log_enabled: bool,
     cursor_status: str,
 ) -> None:
     lines = [
         f"Gaze: {result.stable_direction}  raw: {result.raw_direction}",
         f"Eyes: {result.eyes_found}  Center: {estimator.center_x:.2f}, {estimator.center_y:.2f}",
-        f"Threshold offset: {threshold_offset}  Log: {'on' if log_enabled else 'off'}  Cursor: {cursor_status}",
-        "C - calibrate | M - cursor | +/- threshold | Q - exit",
+        f"Detector: MediaPipe Face Landmarker  Log: {'on' if log_enabled else 'off'}  Cursor: {cursor_status}",
+        "C - calibrate | M - cursor | Q - exit",
     ]
 
     y = 34
@@ -276,47 +363,34 @@ def draw_hud(
 
 def process_frame(
     frame: np.ndarray,
-    face_cascade: cv2.CascadeClassifier,
-    eye_cascade: cv2.CascadeClassifier,
+    face_landmarker,
     estimator: GazeEstimator,
-    threshold_offset: int,
     log_enabled: bool,
     cursor_status: str,
 ) -> FrameResult:
     frame = cv2.flip(frame, 1)
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    faces = face_cascade.detectMultiScale(
-        gray, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)
-    )
+    frame_height, frame_width = frame.shape[:2]
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    landmark_result = face_landmarker.detect(mp_image)
 
     gaze_results: list[GazeResult] = []
 
-    for face_x, face_y, face_w, face_h in faces[:1]:
-        cv2.rectangle(
-            frame,
-            (face_x, face_y),
-            (face_x + face_w, face_y + face_h),
-            (255, 180, 70),
-            2,
-        )
-
-        upper_face_gray = gray[face_y : face_y + face_h // 2, face_x : face_x + face_w]
-        eyes = eye_cascade.detectMultiScale(
-            upper_face_gray,
-            scaleFactor=1.15,
-            minNeighbors=8,
-            minSize=(22, 16),
-        )
-
-        eyes = sorted(eyes, key=lambda box: box[2] * box[3], reverse=True)[:2]
-
-        for eye_x, eye_y, eye_w, eye_h in eyes:
-            absolute_box = (face_x + eye_x, face_y + eye_y, eye_w, eye_h)
-            eye_gray = upper_face_gray[eye_y : eye_y + eye_h, eye_x : eye_x + eye_w]
-            result = detect_pupil(eye_gray, threshold_offset)
+    if landmark_result.face_landmarks:
+        landmarks = landmark_result.face_landmarks[0]
+        for eye_indexes, iris_indexes in (
+            (LEFT_EYE_CONTOUR, LEFT_IRIS),
+            (RIGHT_EYE_CONTOUR, RIGHT_IRIS),
+        ):
+            result, eye_points = estimate_eye_from_landmarks(
+                landmarks,
+                eye_indexes,
+                iris_indexes,
+                frame_width,
+                frame_height,
+            )
             gaze_results.append(result)
-            draw_eye_result(frame, absolute_box, result)
+            draw_landmark_eye(frame, eye_points, result)
 
     ratio_x, ratio_y = average_gaze(gaze_results)
     raw_direction = estimator.classify(ratio_x, ratio_y)
@@ -330,22 +404,20 @@ def process_frame(
         ratio_y=ratio_y,
         eyes_found=len(gaze_results),
     )
-    draw_hud(frame, result, estimator, threshold_offset, log_enabled, cursor_status)
+    draw_hud(frame, result, estimator, log_enabled, cursor_status)
     return result
 
 
 def run(
     camera_index: int,
     log_path: Path | None,
-    threshold_offset: int,
     control_cursor: bool,
     cursor_speed: int,
 ) -> None:
-    face_cascade = load_cascade("haarcascade_frontalface_default.xml")
-    eye_cascade = load_cascade("haarcascade_eye.xml")
     estimator = GazeEstimator()
     logger = CsvLogger(log_path)
     cursor = CursorController(control_cursor, cursor_speed)
+    face_landmarker = create_face_landmarker()
 
     camera = cv2.VideoCapture(camera_index)
     if not camera.isOpened():
@@ -361,10 +433,8 @@ def run(
 
             result = process_frame(
                 frame,
-                face_cascade,
-                eye_cascade,
+                face_landmarker,
                 estimator,
-                threshold_offset,
                 log_path is not None,
                 cursor.status(),
             )
@@ -379,11 +449,8 @@ def run(
                 estimator.calibrate(result.ratio_x, result.ratio_y)
             if key == ord("m"):
                 cursor.toggle()
-            if key in (ord("+"), ord("=")):
-                threshold_offset = min(60, threshold_offset + 2)
-            if key in (ord("-"), ord("_")):
-                threshold_offset = max(-60, threshold_offset - 2)
     finally:
+        face_landmarker.close()
         logger.close()
         camera.release()
         cv2.destroyAllWindows()
@@ -404,12 +471,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional CSV file for saving gaze measurements.",
     )
     parser.add_argument(
-        "--threshold-offset",
-        type=int,
-        default=0,
-        help="Manual pupil threshold correction from -60 to 60.",
-    )
-    parser.add_argument(
         "--control-cursor",
         action="store_true",
         help="Enable gaze-based cursor control. Press M in the video window to toggle it.",
@@ -428,7 +489,6 @@ if __name__ == "__main__":
     run(
         camera_index=args.camera,
         log_path=args.log,
-        threshold_offset=int(np.clip(args.threshold_offset, -60, 60)),
         control_cursor=args.control_cursor,
         cursor_speed=max(1, args.cursor_speed),
     )
