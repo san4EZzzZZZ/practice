@@ -8,6 +8,9 @@ import urllib.request
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
+from tkinter import messagebox
+import tkinter as tk
+from tkinter import ttk
 
 import cv2
 import numpy as np
@@ -60,14 +63,15 @@ FACE_LANDMARKER_MODEL_URL = (
 )
 FACE_LANDMARKER_MODEL_PATH = Path(".cache/mediapipe/face_landmarker.task")
 
-COLOR_PANEL = (18, 22, 30)
-COLOR_PANEL_2 = (29, 34, 45)
-COLOR_TEXT = (235, 242, 248)
-COLOR_MUTED = (160, 172, 184)
-COLOR_ACCENT = (51, 217, 178)
-COLOR_WARN = (80, 170, 255)
-COLOR_DANGER = (95, 95, 255)
-COLOR_BLUE = (255, 180, 90)
+COLOR_PANEL = (28, 29, 31)
+COLOR_PANEL_2 = (45, 47, 50)
+COLOR_TEXT = (242, 242, 240)
+COLOR_MUTED = (178, 178, 174)
+COLOR_ACCENT = (84, 204, 170)
+COLOR_WARN = (84, 176, 232)
+COLOR_DANGER = (92, 112, 235)
+COLOR_BLUE = (220, 170, 92)
+COLOR_LINE = (92, 94, 98)
 VIGNETTE_CACHE: dict[tuple[int, int], np.ndarray] = {}
 
 
@@ -396,42 +400,41 @@ class CalibrationSession:
         return False
 
     def render(self) -> np.ndarray:
-        frame = np.zeros((self.screen_h, self.screen_w, 3), dtype=np.uint8)
-        put_text(frame, "Calibration", (40, 60), 1.0, COLOR_TEXT, 2)
-        put_text(frame, "Look at the target and hold still", (40, 102), 0.78, COLOR_MUTED, 2)
-        put_text(frame, self.progress_label(), (40, 138), 0.75, COLOR_ACCENT, 2)
-        put_text(
-            frame,
-            "Wait for the target to stabilize, then keep your eyes on it",
-            (40, 176),
-            0.66,
-            COLOR_MUTED,
-            2,
-        )
+        frame = np.full((self.screen_h, self.screen_w, 3), 18, dtype=np.uint8)
+        panel_w = min(560, self.screen_w - 80)
+        panel_x = 40
+        panel_y = 34
+        draw_panel(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + 210), 0.92)
+
+        put_text(frame, "Screen calibration", (panel_x + 24, panel_y + 40), 0.84, COLOR_TEXT, 2)
+        put_text(frame, "Look at the marker and keep your head steady", (panel_x + 24, panel_y + 73), 0.50, COLOR_MUTED)
+        put_text(frame, self.progress_label(), (panel_x + 24, panel_y + 108), 0.58, COLOR_ACCENT, 2)
 
         if self.active:
             target_x, target_y = self.current_target()
             marker_color = COLOR_ACCENT if self.ready_for_sample() else COLOR_WARN
-            radius = 46 if self.ready_for_sample() else 36
+            radius = 42 if self.ready_for_sample() else 32
+            cv2.circle(frame, (target_x, target_y), radius + 10, COLOR_PANEL_2, 2, cv2.LINE_AA)
             cv2.circle(frame, (target_x, target_y), radius, marker_color, 3, cv2.LINE_AA)
             cv2.circle(frame, (target_x, target_y), 14, COLOR_TEXT, 2, cv2.LINE_AA)
             cv2.circle(frame, (target_x, target_y), 5, COLOR_TEXT, -1, cv2.LINE_AA)
 
-            bar_x = 40
-            bar_y = 220
-            bar_w = min(720, self.screen_w - 80)
+            bar_x = panel_x + 24
+            bar_y = panel_y + 144
+            bar_w = panel_w - 48
             fill = float(np.clip(self.point_frames / max(1, self.settle_frames), 0.0, 1.0))
             draw_progress_bar(frame, "settle", fill, (bar_x, bar_y), bar_w, marker_color)
             draw_progress_bar(
                 frame,
                 "samples",
                 self.point_samples / max(1, self.samples_per_point),
-                (bar_x, bar_y + 46),
+                (bar_x, bar_y + 38),
                 bar_w,
                 COLOR_BLUE,
             )
 
-        put_text(frame, "Press Q to abort calibration", (40, self.screen_h - 40), 0.7, COLOR_MUTED, 2)
+        blend_rect(frame, (0, self.screen_h - 42), (self.screen_w, self.screen_h), COLOR_PANEL, 0.90)
+        put_text(frame, "Q abort calibration", (40, self.screen_h - 15), 0.50, COLOR_TEXT)
         return frame
 
     def build_mapper(self) -> ScreenMapper:
@@ -572,6 +575,16 @@ def blend_rect(
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
 
+def draw_panel(
+    frame: np.ndarray,
+    top_left: tuple[int, int],
+    bottom_right: tuple[int, int],
+    alpha: float = 0.82,
+) -> None:
+    blend_rect(frame, top_left, bottom_right, COLOR_PANEL, alpha)
+    cv2.rectangle(frame, top_left, bottom_right, COLOR_LINE, 1, cv2.LINE_AA)
+
+
 def put_text(
     frame: np.ndarray,
     text: str,
@@ -613,11 +626,11 @@ def draw_status_chip(
     accent: tuple[int, int, int] = COLOR_ACCENT,
 ) -> int:
     x, y = origin
-    width = max(92, 14 + len(text) * 10)
-    color = accent if active else COLOR_PANEL_2
-    blend_rect(frame, (x, y), (x + width, y + 28), color, 0.72 if active else 0.82)
-    cv2.rectangle(frame, (x, y), (x + width, y + 28), color, 1, cv2.LINE_AA)
-    put_text(frame, text, (x + 11, y + 19), 0.46, COLOR_TEXT)
+    width = max(88, 24 + len(text) * 8)
+    draw_panel(frame, (x, y), (x + width, y + 26), 0.76)
+    dot_color = accent if active else COLOR_MUTED
+    cv2.circle(frame, (x + 13, y + 13), 4, dot_color, -1, cv2.LINE_AA)
+    put_text(frame, text, (x + 24, y + 18), 0.42, COLOR_TEXT if active else COLOR_MUTED)
     return width
 
 
@@ -631,10 +644,24 @@ def draw_progress_bar(
 ) -> None:
     x, y = origin
     value = float(np.clip(value, 0.0, 1.0))
-    put_text(frame, label, (x, y), 0.44, COLOR_MUTED)
-    cv2.rectangle(frame, (x, y + 10), (x + width, y + 20), (64, 70, 82), -1)
-    cv2.rectangle(frame, (x, y + 10), (x + int(width * value), y + 20), accent, -1)
-    cv2.rectangle(frame, (x, y + 10), (x + width, y + 20), (92, 100, 112), 1, cv2.LINE_AA)
+    put_text(frame, label, (x, y), 0.42, COLOR_MUTED)
+    put_text(frame, f"{int(value * 100):3d}%", (x + width - 42, y), 0.42, COLOR_MUTED)
+    bar_y = y + 10
+    cv2.rectangle(frame, (x, bar_y), (x + width, bar_y + 8), COLOR_PANEL_2, -1)
+    cv2.rectangle(frame, (x, bar_y), (x + int(width * value), bar_y + 8), accent, -1)
+    cv2.rectangle(frame, (x, bar_y), (x + width, bar_y + 8), COLOR_LINE, 1, cv2.LINE_AA)
+
+
+def draw_metric(
+    frame: np.ndarray,
+    label: str,
+    value: str,
+    origin: tuple[int, int],
+    width: int,
+) -> None:
+    x, y = origin
+    put_text(frame, label, (x, y), 0.40, COLOR_MUTED)
+    put_text(frame, value, (x + width - 86, y), 0.43, COLOR_TEXT)
 
 
 def draw_gaze_pad(
@@ -645,23 +672,45 @@ def draw_gaze_pad(
     size: int,
 ) -> None:
     x, y = origin
-    blend_rect(frame, (x, y), (x + size, y + size), COLOR_PANEL_2, 0.82)
-    cv2.rectangle(frame, (x, y), (x + size, y + size), (80, 90, 104), 1, cv2.LINE_AA)
-    cv2.line(frame, (x + size // 2, y + 12), (x + size // 2, y + size - 12), (70, 78, 90), 1)
-    cv2.line(frame, (x + 12, y + size // 2), (x + size - 12, y + size // 2), (70, 78, 90), 1)
+    draw_panel(frame, (x, y), (x + size, y + size), 0.70)
+    put_text(frame, "gaze map", (x + 12, y + 22), 0.38, COLOR_MUTED)
 
-    center_x = x + int(estimator.center_x * size)
-    center_y = y + int(estimator.center_y * size)
+    grid_top = y + 34
+    grid_bottom = y + size - 12
+    grid_left = x + 12
+    grid_right = x + size - 12
+    cv2.rectangle(frame, (grid_left, grid_top), (grid_right, grid_bottom), COLOR_PANEL_2, -1)
+    cv2.rectangle(frame, (grid_left, grid_top), (grid_right, grid_bottom), COLOR_LINE, 1, cv2.LINE_AA)
+    cv2.line(
+        frame,
+        (grid_left + (grid_right - grid_left) // 2, grid_top + 8),
+        (grid_left + (grid_right - grid_left) // 2, grid_bottom - 8),
+        (74, 76, 80),
+        1,
+    )
+    cv2.line(
+        frame,
+        (grid_left + 8, grid_top + (grid_bottom - grid_top) // 2),
+        (grid_right - 8, grid_top + (grid_bottom - grid_top) // 2),
+        (74, 76, 80),
+        1,
+    )
+
+    usable_w = grid_right - grid_left
+    usable_h = grid_bottom - grid_top
+
+    center_x = grid_left + int(estimator.center_x * usable_w)
+    center_y = grid_top + int(estimator.center_y * usable_h)
     cv2.circle(frame, (center_x, center_y), 5, COLOR_BLUE, 1, cv2.LINE_AA)
 
     if result.ratio_x is None or result.ratio_y is None:
-        put_text(frame, "no face", (x + 18, y + size // 2 + 5), 0.5, COLOR_MUTED)
+        put_text(frame, "no face", (grid_left + 17, grid_top + usable_h // 2 + 5), 0.46, COLOR_MUTED)
         return
 
-    gaze_x = x + int(result.ratio_x * size)
-    gaze_y = y + int(result.ratio_y * size)
-    cv2.circle(frame, (gaze_x, gaze_y), 10, COLOR_ACCENT, -1, cv2.LINE_AA)
-    cv2.circle(frame, (gaze_x, gaze_y), 16, COLOR_ACCENT, 1, cv2.LINE_AA)
+    gaze_x = grid_left + int(result.ratio_x * usable_w)
+    gaze_y = grid_top + int(result.ratio_y * usable_h)
+    cv2.circle(frame, (gaze_x, gaze_y), 7, COLOR_ACCENT, -1, cv2.LINE_AA)
+    cv2.circle(frame, (gaze_x, gaze_y), 13, COLOR_ACCENT, 1, cv2.LINE_AA)
 
 
 def draw_hud(
@@ -675,70 +724,65 @@ def draw_hud(
     calibration_status: str,
 ) -> None:
     height, width = frame.shape[:2]
-    margin = 16
-    top_h = 76
-    bottom_h = 48
+    margin = 14
+    bottom_h = 38
+    sidebar_w = min(328, max(278, width // 3))
 
-    apply_vignette(frame)
-    blend_rect(frame, (0, 0), (width, top_h), COLOR_PANEL, 0.78)
-    blend_rect(frame, (0, height - bottom_h), (width, height), COLOR_PANEL, 0.78)
+    draw_panel(frame, (margin, margin), (margin + sidebar_w, height - margin - bottom_h), 0.76)
+    blend_rect(frame, (0, height - bottom_h), (width, height), COLOR_PANEL, 0.84)
 
-    put_text(frame, "Gaze Studio", (margin, 29), 0.72, COLOR_TEXT, 2)
-    put_text(frame, "MediaPipe Face Landmarker", (margin, 56), 0.46, COLOR_MUTED)
+    panel_x = margin
+    panel_y = margin
+    content_x = panel_x + 18
+    content_w = sidebar_w - 36
+
+    put_text(frame, "Gaze Studio", (content_x, panel_y + 30), 0.68, COLOR_TEXT, 2)
+    put_text(frame, "webcam eye tracking", (content_x, panel_y + 55), 0.42, COLOR_MUTED)
+
+    direction = result.stable_direction.upper().replace("-", " ")
+    direction_color = COLOR_DANGER if result.stable_direction == "unknown" else COLOR_ACCENT
+    put_text(frame, "current gaze", (content_x, panel_y + 92), 0.40, COLOR_MUTED)
+    put_text(frame, direction, (content_x, panel_y + 132), 0.80, direction_color, 2)
+    put_text(frame, f"raw: {result.raw_direction}", (content_x, panel_y + 158), 0.42, COLOR_MUTED)
+
+    draw_progress_bar(
+        frame,
+        "confidence",
+        result.confidence,
+        (content_x, panel_y + 192),
+        content_w,
+        COLOR_ACCENT if result.confidence >= 0.5 else COLOR_DANGER,
+    )
+
+    ratio_text = "x --  y --"
+    if result.ratio_x is not None and result.ratio_y is not None:
+        ratio_text = f"x {result.ratio_x:.2f}  y {result.ratio_y:.2f}"
+    draw_metric(frame, "ratio", ratio_text, (content_x, panel_y + 238), content_w)
+    draw_metric(frame, "eyes", str(result.eyes_found), (content_x, panel_y + 266), content_w)
+    draw_metric(frame, "cursor", cursor_status, (content_x, panel_y + 294), content_w)
+    draw_metric(frame, "log", "on" if log_enabled else "off", (content_x, panel_y + 322), content_w)
+
+    put_text(frame, "motion", (content_x, panel_y + 364), 0.40, COLOR_MUTED)
+    put_text(frame, cursor_motion, (content_x, panel_y + 388), 0.43, COLOR_TEXT)
+    put_text(frame, "calibration", (content_x, panel_y + 426), 0.40, COLOR_MUTED)
+    put_text(frame, calibration_status, (content_x, panel_y + 450), 0.43, COLOR_TEXT)
+
+    pad_size = min(content_w, max(132, height - panel_y - bottom_h - 490))
+    if pad_size >= 120:
+        draw_gaze_pad(frame, result, estimator, (content_x, panel_y + 478), pad_size)
 
     chips = [
         (f"cursor {cursor_status}", cursor_status == "on", COLOR_ACCENT),
         ("log on" if log_enabled else "log off", log_enabled, COLOR_BLUE),
         (f"eyes {result.eyes_found}", result.eyes_found > 0, COLOR_WARN),
     ]
-    chip_widths = [max(92, 14 + len(text) * 10) for text, _, _ in chips]
-    chip_x = max(margin, width - margin - sum(chip_widths) - 8 * (len(chips) - 1))
-    for index, (text, active, accent) in enumerate(chips):
-        chip_x += draw_status_chip(frame, text, (chip_x, 22), active, accent)
-        if index < len(chips) - 1:
-            chip_x += 8
+    chip_x = margin + sidebar_w + 12
+    chip_y = margin
+    for text, active, accent in chips:
+        chip_x += draw_status_chip(frame, text, (chip_x, chip_y), active, accent) + 8
 
-    panel_w = min(310, max(240, width // 3))
-    panel_h = 232
-    panel_x = margin
-    panel_y = top_h + 16
-    blend_rect(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), COLOR_PANEL, 0.72)
-    cv2.rectangle(
-        frame,
-        (panel_x, panel_y),
-        (panel_x + panel_w, panel_y + panel_h),
-        (68, 78, 92),
-        1,
-        cv2.LINE_AA,
-    )
-
-    direction = result.stable_direction.upper().replace("-", " ")
-    direction_color = COLOR_DANGER if result.stable_direction == "unknown" else COLOR_ACCENT
-    put_text(frame, "CURRENT GAZE", (panel_x + 18, panel_y + 28), 0.43, COLOR_MUTED)
-    put_text(frame, direction, (panel_x + 18, panel_y + 64), 0.86, direction_color, 2)
-    put_text(frame, f"raw: {result.raw_direction}", (panel_x + 18, panel_y + 91), 0.45, COLOR_MUTED)
-
-    draw_progress_bar(
-        frame,
-        "confidence",
-        result.confidence,
-        (panel_x + 18, panel_y + 124),
-        panel_w - 36,
-        COLOR_ACCENT if result.confidence >= 0.5 else COLOR_DANGER,
-    )
-    ratio_text = "x --  y --"
-    if result.ratio_x is not None and result.ratio_y is not None:
-        ratio_text = f"x {result.ratio_x:.2f}  y {result.ratio_y:.2f}"
-    put_text(frame, ratio_text, (panel_x + 18, panel_y + 170), 0.5, COLOR_TEXT)
-    put_text(frame, cursor_motion, (panel_x + 18, panel_y + 194), 0.42, COLOR_MUTED)
-
-    pad_size = 132
-    draw_gaze_pad(frame, result, estimator, (width - pad_size - margin, top_h + 16), pad_size)
-
-    put_text(frame, f"calibration: {calibration_status}", (panel_x + 18, panel_y + 216), 0.42, COLOR_MUTED)
-
-    footer = f"C  calibrate screen    M  cursor toggle    R  reset    Q  quit    {cursor_hint}"
-    put_text(frame, footer, (margin, height - 18), 0.52, COLOR_TEXT)
+    footer = f"C calibrate   M cursor   R reset   Q quit   {cursor_hint}"
+    put_text(frame, footer, (margin, height - 14), 0.46, COLOR_TEXT)
 
 
 def process_frame(
@@ -784,6 +828,373 @@ def process_frame(
         eyes_found=len(gaze_results),
     )
     return result
+
+
+class GazeStudioApp:
+    def __init__(
+        self,
+        camera_index: int,
+        log_path: Path | None,
+        control_cursor: bool,
+        cursor_smoothing: float,
+        cursor_min_confidence: float,
+        calibration_samples: int,
+    ) -> None:
+        self.root = tk.Tk()
+        self.root.title("Eye Tracking Studio")
+        self.root.geometry("1180x760")
+        self.root.minsize(980, 650)
+
+        self.camera_index = camera_index
+        self.log_path = log_path
+        self.calibration_samples = calibration_samples
+        self.camera = None
+        self.face_landmarker = None
+        self.logger: CsvLogger | None = None
+        self.estimator = GazeEstimator()
+        self.cursor = CursorController(control_cursor, cursor_smoothing, cursor_min_confidence)
+        self.screen_w, self.screen_h = get_screen_size()
+        self.calibration = CalibrationSession(self.screen_w, self.screen_h, calibration_samples)
+        self.calibration_window: tk.Toplevel | None = None
+        self.calibration_label: ttk.Label | None = None
+        self.video_image = None
+        self.calibration_image = None
+        self.running = False
+        self.closed = False
+
+        self.cursor_enabled = tk.BooleanVar(value=control_cursor)
+        self.log_enabled = tk.BooleanVar(value=log_path is not None)
+        self.smoothing = tk.DoubleVar(value=cursor_smoothing)
+        self.min_confidence = tk.DoubleVar(value=cursor_min_confidence)
+        self.direction_var = tk.StringVar(value="-")
+        self.raw_var = tk.StringVar(value="-")
+        self.confidence_var = tk.StringVar(value="0%")
+        self.eyes_var = tk.StringVar(value="0")
+        self.ratio_var = tk.StringVar(value="x --  y --")
+        self.cursor_var = tk.StringVar(value=self.cursor.status())
+        self.motion_var = tk.StringVar(value="paused")
+        self.calibration_var = tk.StringVar(value="inactive")
+        self.status_var = tk.StringVar(value="Ready")
+
+        self._build_style()
+        self._build_menu()
+        self._build_layout()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.bind("<Control-q>", lambda _event: self.close())
+        self.root.bind("<F5>", lambda _event: self.start())
+        self.root.bind("<F6>", lambda _event: self.stop())
+        self.root.bind("<Control-r>", lambda _event: self.reset_calibration())
+        self.root.bind("c", lambda _event: self.start_calibration())
+        self.root.bind("m", lambda _event: self.toggle_cursor_control())
+        self.root.bind("r", lambda _event: self.reset_calibration())
+        self.root.bind("q", lambda _event: self.close())
+        self.root.after(100, self.start)
+
+    def _build_style(self) -> None:
+        style = ttk.Style(self.root)
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+        style.configure("Title.TLabel", font=("Segoe UI", 16, "bold"))
+        style.configure("Value.TLabel", font=("Segoe UI", 11))
+        style.configure("BigValue.TLabel", font=("Segoe UI", 22, "bold"))
+        style.configure("Status.TLabel", padding=(8, 4))
+
+    def _build_menu(self) -> None:
+        menu = tk.Menu(self.root)
+
+        file_menu = tk.Menu(menu, tearoff=False)
+        file_menu.add_command(label="Start camera", command=self.start, accelerator="F5")
+        file_menu.add_command(label="Stop camera", command=self.stop, accelerator="F6")
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.close, accelerator="Ctrl+Q")
+        menu.add_cascade(label="File", menu=file_menu)
+
+        tracking_menu = tk.Menu(menu, tearoff=False)
+        tracking_menu.add_command(label="Calibrate screen", command=self.start_calibration)
+        tracking_menu.add_command(label="Reset calibration", command=self.reset_calibration, accelerator="Ctrl+R")
+        tracking_menu.add_separator()
+        tracking_menu.add_checkbutton(
+            label="Cursor control",
+            variable=self.cursor_enabled,
+            command=self.apply_cursor_toggle,
+        )
+        menu.add_cascade(label="Tracking", menu=tracking_menu)
+
+        help_menu = tk.Menu(menu, tearoff=False)
+        help_menu.add_command(label="About", command=self.show_about)
+        menu.add_cascade(label="Help", menu=help_menu)
+
+        self.root.config(menu=menu)
+
+    def _build_layout(self) -> None:
+        main = ttk.Frame(self.root, padding=10)
+        main.pack(fill=tk.BOTH, expand=True)
+        main.columnconfigure(0, weight=1)
+        main.columnconfigure(1, weight=0)
+        main.rowconfigure(0, weight=1)
+
+        video_frame = ttk.LabelFrame(main, text="Camera")
+        video_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        video_frame.columnconfigure(0, weight=1)
+        video_frame.rowconfigure(0, weight=1)
+        self.video_label = ttk.Label(video_frame, anchor=tk.CENTER)
+        self.video_label.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+
+        side = ttk.Frame(main, width=300)
+        side.grid(row=0, column=1, sticky="ns")
+        side.columnconfigure(0, weight=1)
+
+        status_box = ttk.LabelFrame(side, text="Tracking")
+        status_box.grid(row=0, column=0, sticky="ew")
+        status_box.columnconfigure(1, weight=1)
+        ttk.Label(status_box, text="Eye Tracking Studio", style="Title.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 2)
+        )
+        ttk.Label(status_box, textvariable=self.direction_var, style="BigValue.TLabel").grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 12)
+        )
+        self._add_status_row(status_box, 2, "Raw", self.raw_var)
+        self._add_status_row(status_box, 3, "Confidence", self.confidence_var)
+        self._add_status_row(status_box, 4, "Eyes", self.eyes_var)
+        self._add_status_row(status_box, 5, "Ratio", self.ratio_var)
+        self._add_status_row(status_box, 6, "Cursor", self.cursor_var)
+        self._add_status_row(status_box, 7, "Motion", self.motion_var)
+        self._add_status_row(status_box, 8, "Calibration", self.calibration_var)
+
+        control_box = ttk.LabelFrame(side, text="Controls")
+        control_box.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        control_box.columnconfigure(0, weight=1)
+        control_box.columnconfigure(1, weight=1)
+        ttk.Button(control_box, text="Start", command=self.start).grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        ttk.Button(control_box, text="Stop", command=self.stop).grid(row=0, column=1, sticky="ew", padx=8, pady=(8, 4))
+        ttk.Button(control_box, text="Calibrate", command=self.start_calibration).grid(row=1, column=0, sticky="ew", padx=8, pady=4)
+        ttk.Button(control_box, text="Reset", command=self.reset_calibration).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
+        ttk.Checkbutton(
+            control_box,
+            text="Cursor control",
+            variable=self.cursor_enabled,
+            command=self.apply_cursor_toggle,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 4))
+        ttk.Checkbutton(
+            control_box,
+            text="Write CSV log",
+            variable=self.log_enabled,
+            command=self.apply_logging_toggle,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+
+        settings_box = ttk.LabelFrame(side, text="Settings")
+        settings_box.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        settings_box.columnconfigure(0, weight=1)
+        ttk.Label(settings_box, text="Cursor smoothing").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Scale(settings_box, from_=0.0, to=0.95, variable=self.smoothing, command=self.apply_settings).grid(
+            row=1, column=0, sticky="ew", padx=8, pady=(0, 8)
+        )
+        ttk.Label(settings_box, text="Minimum confidence").grid(row=2, column=0, sticky="w", padx=8)
+        ttk.Scale(settings_box, from_=0.0, to=1.0, variable=self.min_confidence, command=self.apply_settings).grid(
+            row=3, column=0, sticky="ew", padx=8, pady=(0, 8)
+        )
+
+        self.status_bar = ttk.Label(self.root, textvariable=self.status_var, style="Status.TLabel", relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def _add_status_row(self, parent: ttk.LabelFrame, row: int, label: str, variable: tk.StringVar) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=10, pady=3)
+        ttk.Label(parent, textvariable=variable, style="Value.TLabel").grid(row=row, column=1, sticky="e", padx=10, pady=3)
+
+    def apply_settings(self, _event=None) -> None:
+        self.cursor.smoothing = float(np.clip(self.smoothing.get(), 0.0, 0.95))
+        self.cursor.min_confidence = float(np.clip(self.min_confidence.get(), 0.0, 1.0))
+
+    def apply_cursor_toggle(self) -> None:
+        self.cursor.active = bool(self.cursor_enabled.get()) and self.cursor.available
+        self.cursor.reset_motion()
+        self.cursor_var.set(self.cursor.status())
+
+    def toggle_cursor_control(self) -> None:
+        self.cursor_enabled.set(not self.cursor_enabled.get())
+        self.apply_cursor_toggle()
+
+    def apply_logging_toggle(self) -> None:
+        if self.log_enabled.get():
+            if self.logger is None:
+                path = self.log_path or Path("gaze_log.csv")
+                self.log_path = path
+                self.logger = CsvLogger(path)
+            self.status_var.set(f"Logging to {self.log_path}")
+            return
+
+        if self.logger is not None:
+            self.logger.close()
+            self.logger = None
+        self.status_var.set("Logging disabled")
+
+    def start(self) -> None:
+        if self.running:
+            return
+        try:
+            if self.face_landmarker is None:
+                self.face_landmarker = create_face_landmarker()
+            if self.camera is None:
+                self.camera = cv2.VideoCapture(self.camera_index)
+            if not self.camera.isOpened():
+                raise RuntimeError(f"Cannot open camera #{self.camera_index}.")
+            if self.log_enabled.get() and self.logger is None:
+                self.logger = CsvLogger(self.log_path or Path("gaze_log.csv"))
+            self.running = True
+            self.status_var.set("Camera started")
+            self.update_frame()
+        except Exception as exc:
+            self.status_var.set(str(exc))
+            messagebox.showerror("Eye Tracking Studio", str(exc))
+
+    def stop(self) -> None:
+        self.running = False
+        if self.camera is not None:
+            self.camera.release()
+            self.camera = None
+        self.close_calibration_window()
+        self.status_var.set("Camera stopped")
+
+    def start_calibration(self) -> None:
+        self.calibration.start()
+        self.cursor.reset_motion()
+        self.open_calibration_window()
+        self.status_var.set("Calibration started")
+
+    def reset_calibration(self) -> None:
+        self.calibration.stop()
+        self.cursor.mapper = None
+        self.cursor.reset_motion()
+        self.close_calibration_window()
+        self.calibration_var.set("inactive")
+        self.cursor_var.set(self.cursor.status())
+        self.status_var.set("Calibration reset")
+
+    def open_calibration_window(self) -> None:
+        if self.calibration_window is not None:
+            return
+        self.calibration_window = tk.Toplevel(self.root)
+        self.calibration_window.title("Screen calibration")
+        self.calibration_window.attributes("-fullscreen", True)
+        self.calibration_window.configure(background="black")
+        self.calibration_label = ttk.Label(self.calibration_window, anchor=tk.CENTER)
+        self.calibration_label.pack(fill=tk.BOTH, expand=True)
+        self.calibration_window.bind("<Escape>", lambda _event: self.reset_calibration())
+        self.calibration_window.bind("q", lambda _event: self.reset_calibration())
+        self.calibration_window.protocol("WM_DELETE_WINDOW", self.reset_calibration)
+
+    def close_calibration_window(self) -> None:
+        if self.calibration_window is not None:
+            self.calibration_window.destroy()
+            self.calibration_window = None
+            self.calibration_label = None
+
+    def update_calibration_window(self) -> None:
+        if self.calibration_window is None or self.calibration_label is None:
+            return
+        frame = self.calibration.render()
+        self.calibration_image = self.frame_to_photo(frame, self.screen_w, self.screen_h)
+        self.calibration_label.configure(image=self.calibration_image)
+
+    def update_frame(self) -> None:
+        if self.closed or not self.running or self.camera is None:
+            return
+
+        ok, frame = self.camera.read()
+        if not ok:
+            self.status_var.set("Cannot read frame from camera")
+            self.stop()
+            return
+
+        result = process_frame(frame, self.face_landmarker, self.estimator)
+        if self.logger is not None:
+            self.logger.write(result)
+
+        if self.calibration.active:
+            done = self.calibration.add_sample(result.ratio_x, result.ratio_y, result.confidence)
+            self.update_calibration_window()
+            self.cursor.reset_motion()
+            if done:
+                self.cursor.set_mapper(self.calibration.build_mapper())
+                self.cursor.active = bool(self.cursor_enabled.get()) and self.cursor.available
+                self.close_calibration_window()
+                self.status_var.set("Calibration complete")
+        else:
+            self.cursor.move(result.ratio_x, result.ratio_y, result.confidence)
+
+        self.update_status(result)
+        self.video_image = self.frame_to_photo(result.frame, 860, 640)
+        self.video_label.configure(image=self.video_image)
+        self.root.after(15, self.update_frame)
+
+    def update_status(self, result: FrameResult) -> None:
+        direction = result.stable_direction.upper().replace("-", " ")
+        self.direction_var.set(direction)
+        self.raw_var.set(result.raw_direction)
+        self.confidence_var.set(f"{int(result.confidence * 100)}%")
+        self.eyes_var.set(str(result.eyes_found))
+        if result.ratio_x is None or result.ratio_y is None:
+            self.ratio_var.set("x --  y --")
+        else:
+            self.ratio_var.set(f"x {result.ratio_x:.2f}  y {result.ratio_y:.2f}")
+        self.cursor_var.set(self.cursor.status())
+        self.motion_var.set(self.cursor.movement_status(result, self.calibration.active))
+        self.calibration_var.set(self.calibration.progress_label())
+
+    def frame_to_photo(self, frame: np.ndarray, max_w: int, max_h: int) -> tk.PhotoImage:
+        height, width = frame.shape[:2]
+        scale = min(max_w / width, max_h / height, 1.0)
+        if scale < 1.0:
+            frame = cv2.resize(frame, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        ok, buffer = cv2.imencode(".ppm", rgb)
+        if not ok:
+            raise RuntimeError("Cannot render frame.")
+        return tk.PhotoImage(data=buffer.tobytes(), format="PPM")
+
+    def show_about(self) -> None:
+        messagebox.showinfo(
+            "About Eye Tracking Studio",
+            "Eye Tracking Studio\n\nWebcam-based gaze tracking demo using OpenCV and MediaPipe.",
+        )
+
+    def close(self) -> None:
+        self.closed = True
+        self.running = False
+        self.close_calibration_window()
+        if self.camera is not None:
+            self.camera.release()
+            self.camera = None
+        if self.face_landmarker is not None:
+            self.face_landmarker.close()
+            self.face_landmarker = None
+        if self.logger is not None:
+            self.logger.close()
+            self.logger = None
+        cv2.destroyAllWindows()
+        self.root.destroy()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+
+def run_desktop_app(
+    camera_index: int,
+    log_path: Path | None,
+    control_cursor: bool,
+    cursor_smoothing: float,
+    cursor_min_confidence: float,
+    calibration_samples: int,
+) -> None:
+    app = GazeStudioApp(
+        camera_index=camera_index,
+        log_path=log_path,
+        control_cursor=control_cursor,
+        cursor_smoothing=cursor_smoothing,
+        cursor_min_confidence=cursor_min_confidence,
+        calibration_samples=calibration_samples,
+    )
+    app.run()
 
 
 def run(
@@ -912,12 +1323,18 @@ def parse_args() -> argparse.Namespace:
         default=14,
         help="Number of stable gaze samples to collect per calibration point.",
     )
+    parser.add_argument(
+        "--opencv-ui",
+        action="store_true",
+        help="Use the old OpenCV overlay interface instead of the desktop window.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    run(
+    runner = run if args.opencv_ui else run_desktop_app
+    runner(
         camera_index=args.camera,
         log_path=args.log,
         control_cursor=args.control_cursor,
