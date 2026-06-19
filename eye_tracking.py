@@ -15,6 +15,13 @@ from tkinter import ttk
 import cv2
 import numpy as np
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = None
+    ImageDraw = None
+    ImageFont = None
+
 MATPLOTLIB_CACHE_DIR = Path(".cache/matplotlib").resolve()
 MATPLOTLIB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(MATPLOTLIB_CACHE_DIR))
@@ -73,6 +80,53 @@ COLOR_DANGER = (92, 112, 235)
 COLOR_BLUE = (220, 170, 92)
 COLOR_LINE = (92, 94, 98)
 VIGNETTE_CACHE: dict[tuple[int, int], np.ndarray] = {}
+FONT_CACHE: dict[tuple[str, int], object] = {}
+
+DIRECTION_LABELS = {
+    "unknown": "неизвестно",
+    "center": "центр",
+    "left": "влево",
+    "right": "вправо",
+    "up": "вверх",
+    "down": "вниз",
+    "up-left": "вверх-влево",
+    "up-right": "вверх-вправо",
+    "down-left": "вниз-влево",
+    "down-right": "вниз-вправо",
+    "detected": "обнаружено",
+}
+
+STATUS_LABELS = {
+    "unavailable": "недоступно",
+    "unmapped": "нет калибровки",
+    "on": "вкл",
+    "off": "выкл",
+    "calibrating": "калибровка",
+    "paused": "пауза",
+    "need calibration": "нужна калибровка",
+    "no gaze": "нет взгляда",
+    "low confidence": "низкая уверенность",
+    "tracking": "отслеживание",
+    "inactive": "неактивна",
+}
+
+
+def direction_label(direction: str) -> str:
+    return DIRECTION_LABELS.get(direction, direction).upper()
+
+
+def status_label(status: str) -> str:
+    if "," in status:
+        return status
+    return STATUS_LABELS.get(status, status)
+
+
+class RussianArgumentParser(argparse.ArgumentParser):
+    def format_usage(self) -> str:
+        return super().format_usage().replace("usage:", "использование:")
+
+    def format_help(self) -> str:
+        return super().format_help().replace("usage:", "использование:")
 
 
 class GazeEstimator:
@@ -164,9 +218,21 @@ class CsvLogger:
 
 
 class ScreenMapper:
-    def __init__(self, coeffs_x: np.ndarray, coeffs_y: np.ndarray) -> None:
+    def __init__(
+        self,
+        coeffs_x: np.ndarray,
+        coeffs_y: np.ndarray,
+        axis_coeffs_x: np.ndarray,
+        axis_coeffs_y: np.ndarray,
+        gaze_center: np.ndarray,
+        gaze_scale: np.ndarray,
+    ) -> None:
         self.coeffs_x = coeffs_x
         self.coeffs_y = coeffs_y
+        self.axis_coeffs_x = axis_coeffs_x
+        self.axis_coeffs_y = axis_coeffs_y
+        self.gaze_center = gaze_center
+        self.gaze_scale = gaze_scale
 
     @staticmethod
     def features(gaze_x: float, gaze_y: float) -> np.ndarray:
@@ -175,29 +241,112 @@ class ScreenMapper:
             dtype=np.float32,
         )
 
+    def normalized_features(self, gaze_x: float, gaze_y: float) -> np.ndarray:
+        gaze = np.array([gaze_x, gaze_y], dtype=np.float32)
+        x, y = (gaze - self.gaze_center) / self.gaze_scale
+        return self.features(float(x), float(y))
+
     def map(self, gaze_x: float, gaze_y: float, screen_w: int, screen_h: int) -> tuple[int, int]:
-        vector = self.features(gaze_x, gaze_y)
-        x = float(np.dot(self.coeffs_x, vector))
-        y = float(np.dot(self.coeffs_y, vector))
+        vector = self.normalized_features(gaze_x, gaze_y)
+        curved_x = float(np.dot(self.coeffs_x, vector))
+        curved_y = float(np.dot(self.coeffs_y, vector))
+        axis_x = float(self.axis_coeffs_x[0] * gaze_x + self.axis_coeffs_x[1])
+        axis_y = float(self.axis_coeffs_y[0] * gaze_y + self.axis_coeffs_y[1])
+
+        if abs(curved_x - axis_x) > screen_w * 0.30:
+            x = axis_x
+        else:
+            x = axis_x * 0.72 + curved_x * 0.28
+
+        if abs(curved_y - axis_y) > screen_h * 0.22:
+            y = axis_y
+        else:
+            y = axis_y * 0.82 + curved_y * 0.18
+
         return (
             int(np.clip(x, 0, screen_w - 1)),
             int(np.clip(y, 0, screen_h - 1)),
         )
+
+    @staticmethod
+    def remove_target_outliers(
+        samples: list[tuple[float, float, int, int]],
+    ) -> list[tuple[float, float, int, int]]:
+        cleaned: list[tuple[float, float, int, int]] = []
+        grouped: dict[tuple[int, int], list[tuple[float, float, int, int]]] = {}
+        for sample in samples:
+            grouped.setdefault((sample[2], sample[3]), []).append(sample)
+
+        for target_samples in grouped.values():
+            if len(target_samples) < 4:
+                cleaned.extend(target_samples)
+                continue
+
+            gaze = np.array([(x, y) for x, y, _, _ in target_samples], dtype=np.float32)
+            median = np.median(gaze, axis=0)
+            distances = np.linalg.norm(gaze - median, axis=1)
+            median_distance = float(np.median(distances))
+            mad = float(np.median(np.abs(distances - median_distance)))
+            limit = median_distance + max(0.035, 2.5 * mad)
+
+            kept = [
+                sample
+                for sample, distance in zip(target_samples, distances)
+                if float(distance) <= limit
+            ]
+            cleaned.extend(kept or target_samples)
+
+        return cleaned
 
     @classmethod
     def fit(
         cls,
         samples: list[tuple[float, float, int, int]],
     ) -> "ScreenMapper":
+        samples = cls.remove_target_outliers(samples)
+        grouped: dict[tuple[int, int], list[tuple[float, float, int, int]]] = {}
+        for sample in samples:
+            grouped.setdefault((sample[2], sample[3]), []).append(sample)
+        target_medians = [
+            (
+                float(np.median([sample[0] for sample in target_samples])),
+                float(np.median([sample[1] for sample in target_samples])),
+                target[0],
+                target[1],
+            )
+            for target, target_samples in grouped.items()
+        ]
+        gaze_values = np.array([(gaze_x, gaze_y) for gaze_x, gaze_y, _, _ in samples], dtype=np.float32)
+        gaze_center = np.mean(gaze_values, axis=0)
+        gaze_scale = np.maximum(np.std(gaze_values, axis=0), np.array([0.035, 0.035], dtype=np.float32))
         matrix = np.array(
-            [cls.features(gaze_x, gaze_y) for gaze_x, gaze_y, _, _ in samples],
+            [
+                cls.features(
+                    float((gaze_x - gaze_center[0]) / gaze_scale[0]),
+                    float((gaze_y - gaze_center[1]) / gaze_scale[1]),
+                )
+                for gaze_x, gaze_y, _, _ in samples
+            ],
             dtype=np.float32,
         )
         targets_x = np.array([screen_x for _, _, screen_x, _ in samples], dtype=np.float32)
         targets_y = np.array([screen_y for _, _, _, screen_y in samples], dtype=np.float32)
-        coeffs_x, *_ = np.linalg.lstsq(matrix, targets_x, rcond=None)
-        coeffs_y, *_ = np.linalg.lstsq(matrix, targets_y, rcond=None)
-        return cls(coeffs_x, coeffs_y)
+
+        penalty = np.diag([0.0, 0.012, 0.012, 0.035, 0.035, 0.035]).astype(np.float32)
+        regularized_matrix = np.vstack([matrix, penalty])
+        regularized_x = np.concatenate([targets_x, np.zeros(matrix.shape[1], dtype=np.float32)])
+        regularized_y = np.concatenate([targets_y, np.zeros(matrix.shape[1], dtype=np.float32)])
+        coeffs_x, *_ = np.linalg.lstsq(regularized_matrix, regularized_x, rcond=None)
+        coeffs_y, *_ = np.linalg.lstsq(regularized_matrix, regularized_y, rcond=None)
+
+        median_gaze_x = np.array([sample[0] for sample in target_medians], dtype=np.float32)
+        median_gaze_y = np.array([sample[1] for sample in target_medians], dtype=np.float32)
+        median_screen_x = np.array([sample[2] for sample in target_medians], dtype=np.float32)
+        median_screen_y = np.array([sample[3] for sample in target_medians], dtype=np.float32)
+        axis_coeffs_x = np.polyfit(median_gaze_x, median_screen_x, 1).astype(np.float32)
+        axis_coeffs_y = np.polyfit(median_gaze_y, median_screen_y, 1).astype(np.float32)
+
+        return cls(coeffs_x, coeffs_y, axis_coeffs_x, axis_coeffs_y, gaze_center, gaze_scale)
 
 
 class CursorController:
@@ -217,6 +366,9 @@ class CursorController:
         self.current_y: float | None = None
         self.gaze_x: float | None = None
         self.gaze_y: float | None = None
+        self.target_x: float | None = None
+        self.target_y: float | None = None
+        self.target_history: deque[tuple[float, float]] = deque(maxlen=5)
 
     def toggle(self) -> None:
         if self.available:
@@ -256,6 +408,9 @@ class CursorController:
         self.current_y = None
         self.gaze_x = None
         self.gaze_y = None
+        self.target_x = None
+        self.target_y = None
+        self.target_history.clear()
 
     def move(
         self,
@@ -269,27 +424,46 @@ class CursorController:
             self.reset_motion()
             return
 
-        gaze_alpha = 0.82
         if self.gaze_x is None or self.gaze_y is None:
             self.gaze_x = ratio_x
             self.gaze_y = ratio_y
         else:
+            gaze_delta = float(np.hypot(ratio_x - self.gaze_x, ratio_y - self.gaze_y))
+            gaze_alpha = 0.28 if gaze_delta > 0.08 else 0.55
             self.gaze_x = self.gaze_x * gaze_alpha + ratio_x * (1.0 - gaze_alpha)
             self.gaze_y = self.gaze_y * gaze_alpha + ratio_y * (1.0 - gaze_alpha)
 
-        point = ctypes.wintypes.POINT()
-        self.user32.GetCursorPos(ctypes.byref(point))
         screen_w = self.user32.GetSystemMetrics(0)
         screen_h = self.user32.GetSystemMetrics(1)
         target_x, target_y = self.mapper.map(self.gaze_x, self.gaze_y, screen_w, screen_h)
+        self.target_history.append((float(target_x), float(target_y)))
+        stable_targets = np.array(self.target_history, dtype=np.float32)
+        target_x = float(np.median(stable_targets[:, 0]))
+        target_y = float(np.median(stable_targets[:, 1]))
 
-        alpha = float(np.clip(self.smoothing, 0.0, 0.98))
+        self.target_x = float(target_x)
+        self.target_y = float(target_y)
+        alpha = float(np.clip(self.smoothing, 0.0, 0.95))
         if self.current_x is None or self.current_y is None:
-            self.current_x = float(point.x)
-            self.current_y = float(point.y)
+            self.current_x = self.target_x
+            self.current_y = self.target_y
+            self.user32.SetCursorPos(int(round(self.current_x)), int(round(self.current_y)))
+            return
 
-        self.current_x = self.current_x * alpha + target_x * (1.0 - alpha)
-        self.current_y = self.current_y * alpha + target_y * (1.0 - alpha)
+        distance = float(np.hypot(self.target_x - self.current_x, self.target_y - self.current_y))
+        if distance < 10:
+            return
+        if distance > 520:
+            alpha = min(alpha, 0.38)
+        elif distance > 280:
+            alpha = min(alpha, 0.52)
+        elif distance > 120:
+            alpha = min(alpha, 0.68)
+        elif distance < 45:
+            alpha = max(alpha, 0.90)
+
+        self.current_x = self.current_x * alpha + self.target_x * (1.0 - alpha)
+        self.current_y = self.current_y * alpha + self.target_y * (1.0 - alpha)
         self.user32.SetCursorPos(int(round(self.current_x)), int(round(self.current_y)))
 
 
@@ -347,6 +521,7 @@ class CalibrationSession:
         self.samples: list[tuple[float, float, int, int]] = []
         self.point_samples = 0
         self.point_frames = 0
+        self.point_buffer: deque[tuple[float, float]] = deque(maxlen=10)
 
     def start(self) -> None:
         self.active = True
@@ -354,6 +529,7 @@ class CalibrationSession:
         self.samples.clear()
         self.point_samples = 0
         self.point_frames = 0
+        self.point_buffer.clear()
 
     def stop(self) -> None:
         self.active = False
@@ -364,14 +540,19 @@ class CalibrationSession:
 
     def progress_label(self) -> str:
         if not self.active:
-            return "inactive"
+            return "неактивна"
         return (
-            f"step {self.target_index + 1}/{len(self.targets)} "
-            f"sample {self.point_samples}/{self.samples_per_point}"
+            f"точка {self.target_index + 1}/{len(self.targets)} "
+            f"образец {self.point_samples}/{self.samples_per_point}"
         )
 
     def ready_for_sample(self) -> bool:
-        return self.point_frames >= self.settle_frames
+        if self.point_frames < self.settle_frames or len(self.point_buffer) < 6:
+            return False
+        values = np.array(self.point_buffer, dtype=np.float32)
+        spread_x = float(np.std(values[:, 0]))
+        spread_y = float(np.std(values[:, 1]))
+        return spread_x < 0.045 and spread_y < 0.050
 
     def add_sample(self, ratio_x: float | None, ratio_y: float | None, confidence: float) -> bool:
         if not self.active or ratio_x is None or ratio_y is None:
@@ -382,18 +563,23 @@ class CalibrationSession:
             return False
 
         self.point_frames += 1
+        self.point_buffer.append((ratio_x, ratio_y))
         if not self.ready_for_sample():
             return False
         if (self.point_frames - self.settle_frames) % self.sample_stride != 0:
             return False
 
         screen_x, screen_y = self.current_target()
-        self.samples.append((ratio_x, ratio_y, screen_x, screen_y))
+        stable_values = np.array(self.point_buffer, dtype=np.float32)
+        stable_x = float(np.median(stable_values[:, 0]))
+        stable_y = float(np.median(stable_values[:, 1]))
+        self.samples.append((stable_x, stable_y, screen_x, screen_y))
         self.point_samples += 1
         if self.point_samples >= self.samples_per_point:
             self.point_samples = 0
             self.target_index += 1
             self.point_frames = 0
+            self.point_buffer.clear()
             if self.target_index >= len(self.targets):
                 self.active = False
                 return True
@@ -406,8 +592,8 @@ class CalibrationSession:
         panel_y = 34
         draw_panel(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + 210), 0.92)
 
-        put_text(frame, "Screen calibration", (panel_x + 24, panel_y + 40), 0.84, COLOR_TEXT, 2)
-        put_text(frame, "Look at the marker and keep your head steady", (panel_x + 24, panel_y + 73), 0.50, COLOR_MUTED)
+        put_text(frame, "Калибровка экрана", (panel_x + 24, panel_y + 40), 0.84, COLOR_TEXT, 2)
+        put_text(frame, "Смотрите на маркер и держите голову ровно", (panel_x + 24, panel_y + 73), 0.50, COLOR_MUTED)
         put_text(frame, self.progress_label(), (panel_x + 24, panel_y + 108), 0.58, COLOR_ACCENT, 2)
 
         if self.active:
@@ -423,10 +609,10 @@ class CalibrationSession:
             bar_y = panel_y + 144
             bar_w = panel_w - 48
             fill = float(np.clip(self.point_frames / max(1, self.settle_frames), 0.0, 1.0))
-            draw_progress_bar(frame, "settle", fill, (bar_x, bar_y), bar_w, marker_color)
+            draw_progress_bar(frame, "стабилизация", fill, (bar_x, bar_y), bar_w, marker_color)
             draw_progress_bar(
                 frame,
-                "samples",
+                "образцы",
                 self.point_samples / max(1, self.samples_per_point),
                 (bar_x, bar_y + 38),
                 bar_w,
@@ -434,12 +620,12 @@ class CalibrationSession:
             )
 
         blend_rect(frame, (0, self.screen_h - 42), (self.screen_w, self.screen_h), COLOR_PANEL, 0.90)
-        put_text(frame, "Q abort calibration", (40, self.screen_h - 15), 0.50, COLOR_TEXT)
+        put_text(frame, "Q - отменить калибровку", (40, self.screen_h - 15), 0.50, COLOR_TEXT)
         return frame
 
     def build_mapper(self) -> ScreenMapper:
         if len(self.samples) < 12:
-            raise RuntimeError("Not enough calibration samples collected.")
+            raise RuntimeError("Собрано недостаточно образцов калибровки.")
         return ScreenMapper.fit(self.samples)
 
 
@@ -455,8 +641,8 @@ def ensure_face_landmarker_model() -> Path:
         )
     except OSError as exc:
         raise RuntimeError(
-            "Cannot download MediaPipe Face Landmarker model. "
-            f"Download it manually from {FACE_LANDMARKER_MODEL_URL} and save it to "
+            "Не удалось скачать модель MediaPipe Face Landmarker. "
+            f"Скачайте ее вручную с {FACE_LANDMARKER_MODEL_URL} и сохраните в "
             f"{FACE_LANDMARKER_MODEL_PATH}."
         ) from exc
 
@@ -466,7 +652,7 @@ def ensure_face_landmarker_model() -> Path:
 def create_face_landmarker():
     if mp is None:
         raise RuntimeError(
-            "MediaPipe is not installed. Use Python 3.10-3.12, then run "
+            "MediaPipe не установлен. Используйте Python 3.10-3.12, затем выполните "
             "`pip install -r requirements.txt`."
         )
 
@@ -593,6 +779,29 @@ def put_text(
     color: tuple[int, int, int] = COLOR_TEXT,
     thickness: int = 1,
 ) -> None:
+    if Image is not None and ImageDraw is not None and ImageFont is not None:
+        font_size = max(10, int(round(scale * 32)))
+        font_key = ("bold" if thickness > 1 else "regular", font_size)
+        font = FONT_CACHE.get(font_key)
+        if font is None:
+            font_names = ["segoeuib.ttf", "arialbd.ttf"] if thickness > 1 else ["segoeui.ttf", "arial.ttf"]
+            for font_name in font_names:
+                try:
+                    font = ImageFont.truetype(f"C:/Windows/Fonts/{font_name}", font_size)
+                    break
+                except OSError:
+                    font = None
+            if font is None:
+                font = ImageFont.load_default()
+            FONT_CACHE[font_key] = font
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(rgb)
+        draw = ImageDraw.Draw(image)
+        draw.text(origin, text, font=font, fill=(color[2], color[1], color[0]))
+        frame[:] = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        return
+
     cv2.putText(
         frame,
         text,
@@ -661,7 +870,7 @@ def draw_metric(
 ) -> None:
     x, y = origin
     put_text(frame, label, (x, y), 0.40, COLOR_MUTED)
-    put_text(frame, value, (x + width - 86, y), 0.43, COLOR_TEXT)
+    put_text(frame, value, (x + width - 124, y), 0.43, COLOR_TEXT)
 
 
 def draw_gaze_pad(
@@ -673,7 +882,7 @@ def draw_gaze_pad(
 ) -> None:
     x, y = origin
     draw_panel(frame, (x, y), (x + size, y + size), 0.70)
-    put_text(frame, "gaze map", (x + 12, y + 22), 0.38, COLOR_MUTED)
+    put_text(frame, "карта взгляда", (x + 12, y + 22), 0.38, COLOR_MUTED)
 
     grid_top = y + 34
     grid_bottom = y + size - 12
@@ -704,7 +913,7 @@ def draw_gaze_pad(
     cv2.circle(frame, (center_x, center_y), 5, COLOR_BLUE, 1, cv2.LINE_AA)
 
     if result.ratio_x is None or result.ratio_y is None:
-        put_text(frame, "no face", (grid_left + 17, grid_top + usable_h // 2 + 5), 0.46, COLOR_MUTED)
+        put_text(frame, "лица нет", (grid_left + 17, grid_top + usable_h // 2 + 5), 0.46, COLOR_MUTED)
         return
 
     gaze_x = grid_left + int(result.ratio_x * usable_w)
@@ -736,18 +945,18 @@ def draw_hud(
     content_x = panel_x + 18
     content_w = sidebar_w - 36
 
-    put_text(frame, "Gaze Studio", (content_x, panel_y + 30), 0.68, COLOR_TEXT, 2)
-    put_text(frame, "webcam eye tracking", (content_x, panel_y + 55), 0.42, COLOR_MUTED)
+    put_text(frame, "Студия взгляда", (content_x, panel_y + 30), 0.68, COLOR_TEXT, 2)
+    put_text(frame, "отслеживание взгляда с веб-камеры", (content_x, panel_y + 55), 0.42, COLOR_MUTED)
 
-    direction = result.stable_direction.upper().replace("-", " ")
+    direction = direction_label(result.stable_direction)
     direction_color = COLOR_DANGER if result.stable_direction == "unknown" else COLOR_ACCENT
-    put_text(frame, "current gaze", (content_x, panel_y + 92), 0.40, COLOR_MUTED)
+    put_text(frame, "текущий взгляд", (content_x, panel_y + 92), 0.40, COLOR_MUTED)
     put_text(frame, direction, (content_x, panel_y + 132), 0.80, direction_color, 2)
-    put_text(frame, f"raw: {result.raw_direction}", (content_x, panel_y + 158), 0.42, COLOR_MUTED)
+    put_text(frame, f"сырой: {direction_label(result.raw_direction).lower()}", (content_x, panel_y + 158), 0.42, COLOR_MUTED)
 
     draw_progress_bar(
         frame,
-        "confidence",
+        "уверенность",
         result.confidence,
         (content_x, panel_y + 192),
         content_w,
@@ -757,14 +966,14 @@ def draw_hud(
     ratio_text = "x --  y --"
     if result.ratio_x is not None and result.ratio_y is not None:
         ratio_text = f"x {result.ratio_x:.2f}  y {result.ratio_y:.2f}"
-    draw_metric(frame, "ratio", ratio_text, (content_x, panel_y + 238), content_w)
-    draw_metric(frame, "eyes", str(result.eyes_found), (content_x, panel_y + 266), content_w)
-    draw_metric(frame, "cursor", cursor_status, (content_x, panel_y + 294), content_w)
-    draw_metric(frame, "log", "on" if log_enabled else "off", (content_x, panel_y + 322), content_w)
+    draw_metric(frame, "координаты", ratio_text, (content_x, panel_y + 238), content_w)
+    draw_metric(frame, "глаза", str(result.eyes_found), (content_x, panel_y + 266), content_w)
+    draw_metric(frame, "курсор", status_label(cursor_status), (content_x, panel_y + 294), content_w)
+    draw_metric(frame, "журнал", "вкл" if log_enabled else "выкл", (content_x, panel_y + 322), content_w)
 
-    put_text(frame, "motion", (content_x, panel_y + 364), 0.40, COLOR_MUTED)
-    put_text(frame, cursor_motion, (content_x, panel_y + 388), 0.43, COLOR_TEXT)
-    put_text(frame, "calibration", (content_x, panel_y + 426), 0.40, COLOR_MUTED)
+    put_text(frame, "движение", (content_x, panel_y + 364), 0.40, COLOR_MUTED)
+    put_text(frame, status_label(cursor_motion), (content_x, panel_y + 388), 0.43, COLOR_TEXT)
+    put_text(frame, "калибровка", (content_x, panel_y + 426), 0.40, COLOR_MUTED)
     put_text(frame, calibration_status, (content_x, panel_y + 450), 0.43, COLOR_TEXT)
 
     pad_size = min(content_w, max(132, height - panel_y - bottom_h - 490))
@@ -772,16 +981,16 @@ def draw_hud(
         draw_gaze_pad(frame, result, estimator, (content_x, panel_y + 478), pad_size)
 
     chips = [
-        (f"cursor {cursor_status}", cursor_status == "on", COLOR_ACCENT),
-        ("log on" if log_enabled else "log off", log_enabled, COLOR_BLUE),
-        (f"eyes {result.eyes_found}", result.eyes_found > 0, COLOR_WARN),
+        (f"курсор {status_label(cursor_status)}", cursor_status == "on", COLOR_ACCENT),
+        ("журнал вкл" if log_enabled else "журнал выкл", log_enabled, COLOR_BLUE),
+        (f"глаза {result.eyes_found}", result.eyes_found > 0, COLOR_WARN),
     ]
     chip_x = margin + sidebar_w + 12
     chip_y = margin
     for text, active, accent in chips:
         chip_x += draw_status_chip(frame, text, (chip_x, chip_y), active, accent) + 8
 
-    footer = f"C calibrate   M cursor   R reset   Q quit   {cursor_hint}"
+    footer = f"C калибровка   M курсор   R сброс   Q выход   {cursor_hint}"
     put_text(frame, footer, (margin, height - 14), 0.46, COLOR_TEXT)
 
 
@@ -841,7 +1050,7 @@ class GazeStudioApp:
         calibration_samples: int,
     ) -> None:
         self.root = tk.Tk()
-        self.root.title("Eye Tracking Studio")
+        self.root.title("Студия отслеживания взгляда")
         self.root.geometry("1180x760")
         self.root.minsize(980, 650)
 
@@ -856,7 +1065,7 @@ class GazeStudioApp:
         self.screen_w, self.screen_h = get_screen_size()
         self.calibration = CalibrationSession(self.screen_w, self.screen_h, calibration_samples)
         self.calibration_window: tk.Toplevel | None = None
-        self.calibration_label: ttk.Label | None = None
+        self.calibration_label: tk.Label | None = None
         self.video_image = None
         self.calibration_image = None
         self.running = False
@@ -871,10 +1080,10 @@ class GazeStudioApp:
         self.confidence_var = tk.StringVar(value="0%")
         self.eyes_var = tk.StringVar(value="0")
         self.ratio_var = tk.StringVar(value="x --  y --")
-        self.cursor_var = tk.StringVar(value=self.cursor.status())
-        self.motion_var = tk.StringVar(value="paused")
-        self.calibration_var = tk.StringVar(value="inactive")
-        self.status_var = tk.StringVar(value="Ready")
+        self.cursor_var = tk.StringVar(value=status_label(self.cursor.status()))
+        self.motion_var = tk.StringVar(value="пауза")
+        self.calibration_var = tk.StringVar(value="неактивна")
+        self.status_var = tk.StringVar(value="Готово")
 
         self._build_style()
         self._build_menu()
@@ -903,26 +1112,26 @@ class GazeStudioApp:
         menu = tk.Menu(self.root)
 
         file_menu = tk.Menu(menu, tearoff=False)
-        file_menu.add_command(label="Start camera", command=self.start, accelerator="F5")
-        file_menu.add_command(label="Stop camera", command=self.stop, accelerator="F6")
+        file_menu.add_command(label="Запустить камеру", command=self.start, accelerator="F5")
+        file_menu.add_command(label="Остановить камеру", command=self.stop, accelerator="F6")
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.close, accelerator="Ctrl+Q")
-        menu.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Выход", command=self.close, accelerator="Ctrl+Q")
+        menu.add_cascade(label="Файл", menu=file_menu)
 
         tracking_menu = tk.Menu(menu, tearoff=False)
-        tracking_menu.add_command(label="Calibrate screen", command=self.start_calibration)
-        tracking_menu.add_command(label="Reset calibration", command=self.reset_calibration, accelerator="Ctrl+R")
+        tracking_menu.add_command(label="Калибровать экран", command=self.start_calibration)
+        tracking_menu.add_command(label="Сбросить калибровку", command=self.reset_calibration, accelerator="Ctrl+R")
         tracking_menu.add_separator()
         tracking_menu.add_checkbutton(
-            label="Cursor control",
+            label="Управление курсором",
             variable=self.cursor_enabled,
             command=self.apply_cursor_toggle,
         )
-        menu.add_cascade(label="Tracking", menu=tracking_menu)
+        menu.add_cascade(label="Отслеживание", menu=tracking_menu)
 
         help_menu = tk.Menu(menu, tearoff=False)
-        help_menu.add_command(label="About", command=self.show_about)
-        menu.add_cascade(label="Help", menu=help_menu)
+        help_menu.add_command(label="О программе", command=self.show_about)
+        menu.add_cascade(label="Справка", menu=help_menu)
 
         self.root.config(menu=menu)
 
@@ -933,7 +1142,7 @@ class GazeStudioApp:
         main.columnconfigure(1, weight=0)
         main.rowconfigure(0, weight=1)
 
-        video_frame = ttk.LabelFrame(main, text="Camera")
+        video_frame = ttk.LabelFrame(main, text="Камера")
         video_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         video_frame.columnconfigure(0, weight=1)
         video_frame.rowconfigure(0, weight=1)
@@ -944,52 +1153,52 @@ class GazeStudioApp:
         side.grid(row=0, column=1, sticky="ns")
         side.columnconfigure(0, weight=1)
 
-        status_box = ttk.LabelFrame(side, text="Tracking")
+        status_box = ttk.LabelFrame(side, text="Отслеживание")
         status_box.grid(row=0, column=0, sticky="ew")
         status_box.columnconfigure(1, weight=1)
-        ttk.Label(status_box, text="Eye Tracking Studio", style="Title.TLabel").grid(
+        ttk.Label(status_box, text="Студия взгляда", style="Title.TLabel").grid(
             row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 2)
         )
         ttk.Label(status_box, textvariable=self.direction_var, style="BigValue.TLabel").grid(
             row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(0, 12)
         )
-        self._add_status_row(status_box, 2, "Raw", self.raw_var)
-        self._add_status_row(status_box, 3, "Confidence", self.confidence_var)
-        self._add_status_row(status_box, 4, "Eyes", self.eyes_var)
-        self._add_status_row(status_box, 5, "Ratio", self.ratio_var)
-        self._add_status_row(status_box, 6, "Cursor", self.cursor_var)
-        self._add_status_row(status_box, 7, "Motion", self.motion_var)
-        self._add_status_row(status_box, 8, "Calibration", self.calibration_var)
+        self._add_status_row(status_box, 2, "Сырой сигнал", self.raw_var)
+        self._add_status_row(status_box, 3, "Уверенность", self.confidence_var)
+        self._add_status_row(status_box, 4, "Глаза", self.eyes_var)
+        self._add_status_row(status_box, 5, "Координаты", self.ratio_var)
+        self._add_status_row(status_box, 6, "Курсор", self.cursor_var)
+        self._add_status_row(status_box, 7, "Движение", self.motion_var)
+        self._add_status_row(status_box, 8, "Калибровка", self.calibration_var)
 
-        control_box = ttk.LabelFrame(side, text="Controls")
+        control_box = ttk.LabelFrame(side, text="Управление")
         control_box.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         control_box.columnconfigure(0, weight=1)
         control_box.columnconfigure(1, weight=1)
-        ttk.Button(control_box, text="Start", command=self.start).grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        ttk.Button(control_box, text="Stop", command=self.stop).grid(row=0, column=1, sticky="ew", padx=8, pady=(8, 4))
-        ttk.Button(control_box, text="Calibrate", command=self.start_calibration).grid(row=1, column=0, sticky="ew", padx=8, pady=4)
-        ttk.Button(control_box, text="Reset", command=self.reset_calibration).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
+        ttk.Button(control_box, text="Старт", command=self.start).grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        ttk.Button(control_box, text="Стоп", command=self.stop).grid(row=0, column=1, sticky="ew", padx=8, pady=(8, 4))
+        ttk.Button(control_box, text="Калибровка", command=self.start_calibration).grid(row=1, column=0, sticky="ew", padx=8, pady=4)
+        ttk.Button(control_box, text="Сброс", command=self.reset_calibration).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
         ttk.Checkbutton(
             control_box,
-            text="Cursor control",
+            text="Управление курсором",
             variable=self.cursor_enabled,
             command=self.apply_cursor_toggle,
         ).grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 4))
         ttk.Checkbutton(
             control_box,
-            text="Write CSV log",
+            text="Записывать CSV-журнал",
             variable=self.log_enabled,
             command=self.apply_logging_toggle,
         ).grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=4)
 
-        settings_box = ttk.LabelFrame(side, text="Settings")
+        settings_box = ttk.LabelFrame(side, text="Настройки")
         settings_box.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         settings_box.columnconfigure(0, weight=1)
-        ttk.Label(settings_box, text="Cursor smoothing").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(settings_box, text="Сглаживание курсора").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 0))
         ttk.Scale(settings_box, from_=0.0, to=0.95, variable=self.smoothing, command=self.apply_settings).grid(
             row=1, column=0, sticky="ew", padx=8, pady=(0, 8)
         )
-        ttk.Label(settings_box, text="Minimum confidence").grid(row=2, column=0, sticky="w", padx=8)
+        ttk.Label(settings_box, text="Минимальная уверенность").grid(row=2, column=0, sticky="w", padx=8)
         ttk.Scale(settings_box, from_=0.0, to=1.0, variable=self.min_confidence, command=self.apply_settings).grid(
             row=3, column=0, sticky="ew", padx=8, pady=(0, 8)
         )
@@ -1008,7 +1217,7 @@ class GazeStudioApp:
     def apply_cursor_toggle(self) -> None:
         self.cursor.active = bool(self.cursor_enabled.get()) and self.cursor.available
         self.cursor.reset_motion()
-        self.cursor_var.set(self.cursor.status())
+        self.cursor_var.set(status_label(self.cursor.status()))
 
     def toggle_cursor_control(self) -> None:
         self.cursor_enabled.set(not self.cursor_enabled.get())
@@ -1020,13 +1229,13 @@ class GazeStudioApp:
                 path = self.log_path or Path("gaze_log.csv")
                 self.log_path = path
                 self.logger = CsvLogger(path)
-            self.status_var.set(f"Logging to {self.log_path}")
+            self.status_var.set(f"Запись журнала: {self.log_path}")
             return
 
         if self.logger is not None:
             self.logger.close()
             self.logger = None
-        self.status_var.set("Logging disabled")
+        self.status_var.set("Запись журнала выключена")
 
     def start(self) -> None:
         if self.running:
@@ -1037,15 +1246,15 @@ class GazeStudioApp:
             if self.camera is None:
                 self.camera = cv2.VideoCapture(self.camera_index)
             if not self.camera.isOpened():
-                raise RuntimeError(f"Cannot open camera #{self.camera_index}.")
+                raise RuntimeError(f"Не удалось открыть камеру #{self.camera_index}.")
             if self.log_enabled.get() and self.logger is None:
                 self.logger = CsvLogger(self.log_path or Path("gaze_log.csv"))
             self.running = True
-            self.status_var.set("Camera started")
+            self.status_var.set("Камера запущена")
             self.update_frame()
         except Exception as exc:
             self.status_var.set(str(exc))
-            messagebox.showerror("Eye Tracking Studio", str(exc))
+            messagebox.showerror("Студия отслеживания взгляда", str(exc))
 
     def stop(self) -> None:
         self.running = False
@@ -1053,32 +1262,41 @@ class GazeStudioApp:
             self.camera.release()
             self.camera = None
         self.close_calibration_window()
-        self.status_var.set("Camera stopped")
+        self.status_var.set("Камера остановлена")
 
     def start_calibration(self) -> None:
         self.calibration.start()
         self.cursor.reset_motion()
         self.open_calibration_window()
-        self.status_var.set("Calibration started")
+        self.update_calibration_window()
+        self.status_var.set("Калибровка запущена")
 
     def reset_calibration(self) -> None:
         self.calibration.stop()
         self.cursor.mapper = None
         self.cursor.reset_motion()
         self.close_calibration_window()
-        self.calibration_var.set("inactive")
-        self.cursor_var.set(self.cursor.status())
-        self.status_var.set("Calibration reset")
+        self.calibration_var.set("неактивна")
+        self.cursor_var.set(status_label(self.cursor.status()))
+        self.status_var.set("Калибровка сброшена")
 
     def open_calibration_window(self) -> None:
         if self.calibration_window is not None:
             return
         self.calibration_window = tk.Toplevel(self.root)
-        self.calibration_window.title("Screen calibration")
+        self.calibration_window.title("Калибровка экрана")
         self.calibration_window.attributes("-fullscreen", True)
         self.calibration_window.configure(background="black")
-        self.calibration_label = ttk.Label(self.calibration_window, anchor=tk.CENTER)
+        self.calibration_label = tk.Label(
+            self.calibration_window,
+            anchor=tk.CENTER,
+            background="black",
+            borderwidth=0,
+            highlightthickness=0,
+        )
         self.calibration_label.pack(fill=tk.BOTH, expand=True)
+        self.calibration_window.lift()
+        self.calibration_window.focus_force()
         self.calibration_window.bind("<Escape>", lambda _event: self.reset_calibration())
         self.calibration_window.bind("q", lambda _event: self.reset_calibration())
         self.calibration_window.protocol("WM_DELETE_WINDOW", self.reset_calibration)
@@ -1102,7 +1320,7 @@ class GazeStudioApp:
 
         ok, frame = self.camera.read()
         if not ok:
-            self.status_var.set("Cannot read frame from camera")
+            self.status_var.set("Не удалось получить кадр с камеры")
             self.stop()
             return
 
@@ -1118,7 +1336,7 @@ class GazeStudioApp:
                 self.cursor.set_mapper(self.calibration.build_mapper())
                 self.cursor.active = bool(self.cursor_enabled.get()) and self.cursor.available
                 self.close_calibration_window()
-                self.status_var.set("Calibration complete")
+                self.status_var.set("Калибровка завершена")
         else:
             self.cursor.move(result.ratio_x, result.ratio_y, result.confidence)
 
@@ -1128,17 +1346,16 @@ class GazeStudioApp:
         self.root.after(15, self.update_frame)
 
     def update_status(self, result: FrameResult) -> None:
-        direction = result.stable_direction.upper().replace("-", " ")
-        self.direction_var.set(direction)
-        self.raw_var.set(result.raw_direction)
+        self.direction_var.set(direction_label(result.stable_direction))
+        self.raw_var.set(direction_label(result.raw_direction).lower())
         self.confidence_var.set(f"{int(result.confidence * 100)}%")
         self.eyes_var.set(str(result.eyes_found))
         if result.ratio_x is None or result.ratio_y is None:
             self.ratio_var.set("x --  y --")
         else:
             self.ratio_var.set(f"x {result.ratio_x:.2f}  y {result.ratio_y:.2f}")
-        self.cursor_var.set(self.cursor.status())
-        self.motion_var.set(self.cursor.movement_status(result, self.calibration.active))
+        self.cursor_var.set(status_label(self.cursor.status()))
+        self.motion_var.set(status_label(self.cursor.movement_status(result, self.calibration.active)))
         self.calibration_var.set(self.calibration.progress_label())
 
     def frame_to_photo(self, frame: np.ndarray, max_w: int, max_h: int) -> tk.PhotoImage:
@@ -1149,13 +1366,13 @@ class GazeStudioApp:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         ok, buffer = cv2.imencode(".ppm", rgb)
         if not ok:
-            raise RuntimeError("Cannot render frame.")
+            raise RuntimeError("Не удалось отрисовать кадр.")
         return tk.PhotoImage(data=buffer.tobytes(), format="PPM")
 
     def show_about(self) -> None:
         messagebox.showinfo(
-            "About Eye Tracking Studio",
-            "Eye Tracking Studio\n\nWebcam-based gaze tracking demo using OpenCV and MediaPipe.",
+            "О программе",
+            "Студия отслеживания взгляда\n\nДемонстрация отслеживания взгляда через веб-камеру на OpenCV и MediaPipe.",
         )
 
     def close(self) -> None:
@@ -1219,20 +1436,20 @@ def run(
     camera = cv2.VideoCapture(camera_index)
     if not camera.isOpened():
         raise RuntimeError(
-            f"Cannot open camera #{camera_index}. Try another index with --camera."
+            f"Не удалось открыть камеру #{camera_index}. Попробуйте другой индекс через --camera."
         )
 
-    window_name = "Gaze Studio"
-    calibration_window = "Calibration"
+    window_name = "Студия взгляда"
+    calibration_window = "Калибровка"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 960, 720)
-    cursor_hint = f"sm {cursor_smoothing:.2f}  conf {cursor_min_confidence:.2f}"
+    cursor_hint = f"сгл {cursor_smoothing:.2f}  ув {cursor_min_confidence:.2f}"
 
     try:
         while True:
             ok, frame = camera.read()
             if not ok:
-                raise RuntimeError("Cannot read frame from camera.")
+                raise RuntimeError("Не удалось получить кадр с камеры.")
 
             result = process_frame(frame, face_landmarker, estimator)
             logger.write(result)
@@ -1287,46 +1504,58 @@ def run(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Simple webcam eye tracking demo.")
+    parser = RussianArgumentParser(
+        description="Демонстрационная система отслеживания взгляда через веб-камеру.",
+        add_help=False,
+    )
+    parser.usage = "%(prog)s [-h] [--camera CAMERA] [--log LOG] [--control-cursor] [--cursor-smoothing VALUE] [--cursor-min-confidence VALUE] [--calibration-samples N] [--opencv-ui]"
+    parser._positionals.title = "позиционные аргументы"
+    parser._optionals.title = "параметры"
+    parser.add_argument(
+        "-h",
+        "--help",
+        action="help",
+        help="показать эту справку и выйти.",
+    )
     parser.add_argument(
         "--camera",
         type=int,
         default=0,
-        help="Camera index, usually 0 for the built-in webcam.",
+        help="Индекс камеры, обычно 0 для встроенной веб-камеры.",
     )
     parser.add_argument(
         "--log",
         type=Path,
         default=None,
-        help="Optional CSV file for saving gaze measurements.",
+        help="Необязательный CSV-файл для записи измерений взгляда.",
     )
     parser.add_argument(
         "--control-cursor",
         action="store_true",
-        help="Start with gaze-based cursor control enabled after calibration. Press M in the video window to toggle it.",
+        help="Включить управление курсором взглядом после калибровки. Клавиша M переключает режим.",
     )
     parser.add_argument(
         "--cursor-smoothing",
         type=float,
-        default=0.84,
-        help="Cursor position smoothing from 0.0 to 0.95. Higher is smoother.",
+        default=0.90,
+        help="Сглаживание положения курсора от 0.0 до 0.95. Чем выше, тем плавнее.",
     )
     parser.add_argument(
         "--cursor-min-confidence",
         type=float,
         default=0.30,
-        help="Minimum gaze confidence required to move the cursor.",
+        help="Минимальная уверенность взгляда для движения курсора.",
     )
     parser.add_argument(
         "--calibration-samples",
         type=int,
         default=14,
-        help="Number of stable gaze samples to collect per calibration point.",
+        help="Количество стабильных образцов взгляда для каждой точки калибровки.",
     )
     parser.add_argument(
         "--opencv-ui",
         action="store_true",
-        help="Use the old OpenCV overlay interface instead of the desktop window.",
+        help="Использовать старый интерфейс OpenCV вместо настольного окна.",
     )
     return parser.parse_args()
 

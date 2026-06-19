@@ -1,3 +1,4 @@
 opencv-python
 numpy
 mediapipe; python_version < "3.13"
+pillow
