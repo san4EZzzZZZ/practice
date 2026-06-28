@@ -5,6 +5,7 @@ import csv
 import os
 import time
 import urllib.request
+import threading
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -724,6 +725,31 @@ def get_screen_size() -> tuple[int, int]:
         user32 = ctypes.windll.user32
         return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
     return 1920, 1080
+
+
+def open_camera(camera_index: int) -> cv2.VideoCapture:
+    backends = []
+    if hasattr(cv2, "CAP_DSHOW"):
+        backends.append(cv2.CAP_DSHOW)
+    backends.append(None)
+
+    last_camera = None
+    for backend in backends:
+        camera = cv2.VideoCapture(camera_index) if backend is None else cv2.VideoCapture(camera_index, backend)
+        last_camera = camera
+        if not camera.isOpened():
+            camera.release()
+            continue
+
+        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+            camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        return camera
+
+    if last_camera is not None:
+        return last_camera
+    raise RuntimeError(f"Не удалось открыть камеру #{camera_index}.")
 
 
 class CalibrationSession:
@@ -1465,6 +1491,19 @@ def process_frame(frame, face_landmarker, estimator, blink_detector: BlinkDetect
     if flip:
         frame = cv2.flip(frame, 1)
     frame_height, frame_width = frame.shape[:2]
+    if face_landmarker is None:
+        raw_direction, stable_direction = estimator.analyze(None, None, 0.0)
+        return FrameResult(
+            frame=frame,
+            raw_direction=raw_direction,
+            stable_direction=stable_direction,
+            ratio_x=None,
+            ratio_y=None,
+            confidence=0.0,
+            eyes_found=0,
+            blink_detected=False,
+        )
+
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -1648,6 +1687,8 @@ class GazeStudioApp:
         self.calibration_image = None
         self.running = False
         self.closed = False
+        self.model_loading = False
+        self.model_load_error: str | None = None
 
         self.cursor_enabled = tk.BooleanVar(value=control_cursor)
         self.gaze_algorithm_var = tk.StringVar(value=GAZE_ALGORITHM_LABELS.get(gaze_algorithm, GAZE_ALGORITHM_LABELS["threshold"]))
@@ -1847,20 +1888,51 @@ class GazeStudioApp:
         if self.running:
             return
         try:
-            if self.face_landmarker is None:
-                self.face_landmarker = create_face_landmarker()
             if self.camera is None:
-                self.camera = cv2.VideoCapture(self.camera_index)
+                self.status_var.set(f"Открытие камеры #{self.camera_index}...")
+                self.root.update_idletasks()
+                self.camera = open_camera(self.camera_index)
             if not self.camera.isOpened():
                 raise RuntimeError(f"Не удалось открыть камеру #{self.camera_index}.")
             if self.log_enabled.get() and self.logger is None:
                 self.logger = CsvLogger(self.log_path or Path("gaze_log.csv"))
             self.running = True
-            self.status_var.set("Камера запущена")
+            if self.face_landmarker is None and not self.model_loading:
+                self._start_model_loader()
+                self.status_var.set("Камера запущена, загрузка модели...")
+            else:
+                self.status_var.set("Камера запущена")
             self.update_frame()
         except Exception as exc:
             self.status_var.set(str(exc))
             messagebox.showerror("Студия отслеживания взгляда", str(exc))
+
+    def _start_model_loader(self) -> None:
+        self.model_loading = True
+        self.model_load_error = None
+
+        def worker() -> None:
+            try:
+                model = create_face_landmarker()
+            except Exception as exc:
+                def on_error() -> None:
+                    self.model_loading = False
+                    self.model_load_error = str(exc)
+                    self.status_var.set(str(exc))
+
+                self.root.after(0, on_error)
+                return
+
+            def on_ready() -> None:
+                self.face_landmarker = model
+                self.model_loading = False
+                self.model_load_error = None
+                if self.running:
+                    self.status_var.set("Камера запущена")
+
+            self.root.after(0, on_ready)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def stop(self) -> None:
         self.running = False
@@ -2045,11 +2117,19 @@ def run(
         mode=cursor_mode,
     )
     blink_detector = BlinkDetector()
-    face_landmarker = create_face_landmarker()
+    face_landmarker_state: dict[str, object | None] = {"value": None}
+
+    def load_model() -> None:
+        print("Загрузка модели MediaPipe...", flush=True)
+        face_landmarker_state["value"] = create_face_landmarker()
+        print("Модель MediaPipe загружена", flush=True)
+
+    threading.Thread(target=load_model, daemon=True).start()
     screen_w, screen_h = get_screen_size()
     calibration = CalibrationSession(screen_w, screen_h, calibration_samples)
 
-    camera = cv2.VideoCapture(camera_index)
+    print(f"Открытие камеры #{camera_index}...", flush=True)
+    camera = open_camera(camera_index)
     if not camera.isOpened():
         raise RuntimeError(
             f"Не удалось открыть камеру #{camera_index}. Попробуйте другой индекс через --camera."
@@ -2067,6 +2147,7 @@ def run(
             if not ok:
                 raise RuntimeError("Не удалось получить кадр с камеры.")
 
+            face_landmarker = face_landmarker_state["value"]
             result = process_frame(frame, face_landmarker, estimator, blink_detector)
             logger.write(result)
 
@@ -2113,7 +2194,9 @@ def run(
                 except cv2.error:
                     pass
     finally:
-        face_landmarker.close()
+        face_landmarker = face_landmarker_state["value"]
+        if face_landmarker is not None:
+            face_landmarker.close()
         logger.close()
         camera.release()
         cv2.destroyAllWindows()
