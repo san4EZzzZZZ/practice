@@ -560,6 +560,48 @@ def landmark_points(
     ]
 
 
+def landmark_point(landmarks, index: int, frame_width: int, frame_height: int) -> tuple[int, int] | None:
+    if index >= len(landmarks):
+        return None
+    return landmark_to_point(landmarks[index], frame_width, frame_height)
+
+
+def eye_opening_ratio(landmarks, eye_indexes: list[int], frame_width: int, frame_height: int) -> float | None:
+    if eye_indexes is LEFT_EYE_CONTOUR:
+        vertical_pairs = ((159, 145), (158, 153), (160, 144))
+        left_corner, right_corner = 33, 133
+    elif eye_indexes is RIGHT_EYE_CONTOUR:
+        vertical_pairs = ((386, 374), (387, 373), (385, 380))
+        left_corner, right_corner = 362, 263
+    else:
+        return None
+
+    left = landmark_point(landmarks, left_corner, frame_width, frame_height)
+    right = landmark_point(landmarks, right_corner, frame_width, frame_height)
+    if left is None or right is None:
+        return None
+
+    horizontal = float(np.linalg.norm(np.array(left, dtype=np.float32) - np.array(right, dtype=np.float32)))
+    if horizontal <= 1.0:
+        return None
+
+    vertical_values: list[float] = []
+    for top_index, bottom_index in vertical_pairs:
+        top = landmark_point(landmarks, top_index, frame_width, frame_height)
+        bottom = landmark_point(landmarks, bottom_index, frame_width, frame_height)
+        if top is None or bottom is None:
+            continue
+        vertical_values.append(
+            float(np.linalg.norm(np.array(top, dtype=np.float32) - np.array(bottom, dtype=np.float32)))
+        )
+
+    if len(vertical_values) < 2:
+        return None
+
+    vertical = float(np.mean(vertical_values))
+    return vertical / horizontal
+
+
 def get_screen_size() -> tuple[int, int]:
     if hasattr(ctypes, "windll"):
         user32 = ctypes.windll.user32
@@ -764,6 +806,7 @@ def estimate_eye_from_landmarks(
 
     eye_array = np.array(eye_points, dtype=np.int32)
     iris_array = np.array(iris_points, dtype=np.float32)
+    openness_ratio = eye_opening_ratio(landmarks, eye_indexes, frame_width, frame_height)
     min_x = int(np.min(eye_array[:, 0]))
     max_x = int(np.max(eye_array[:, 0]))
     min_y = int(np.min(eye_array[:, 1]))
@@ -782,7 +825,13 @@ def estimate_eye_from_landmarks(
     spread_quality = float(np.exp(-((relative_spread - 0.09) / 0.035) ** 2))
     edge_distance = float(min(ratio_x, 1.0 - ratio_x, ratio_y, 1.0 - ratio_y))
     edge_quality = float(np.clip(edge_distance / 0.25, 0.0, 1.0))
-    confidence = float(np.clip(spread_quality * 0.6 + edge_quality * 0.4, 0.05, 1.0))
+    opening_quality = 1.0
+    if openness_ratio is not None:
+        opening_quality = float(np.clip((openness_ratio - 0.14) / 0.16, 0.0, 1.0))
+        if opening_quality < 0.20:
+            return GazeResult("unknown", None, None, None, 0.0), eye_points
+
+    confidence = float(np.clip((spread_quality * 0.6 + edge_quality * 0.4) * opening_quality, 0.0, 1.0))
 
     return (
         GazeResult(
@@ -801,6 +850,9 @@ def draw_landmark_eye(
     eye_points: list[tuple[int, int]],
     result: GazeResult,
 ) -> None:
+    if result.direction == "unknown":
+        return
+
     if len(eye_points) >= 3:
         cv2.polylines(
             frame,
