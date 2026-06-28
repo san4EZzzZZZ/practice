@@ -147,6 +147,50 @@ def status_label(status: str) -> str:
     return STATUS_LABELS.get(status, status)
 
 
+PHYSICAL_KEYCODES = {
+    "q": {81},
+    "c": {67},
+    "m": {77},
+    "r": {82},
+}
+
+
+def hotkey_matches(event, letter: str) -> bool:
+    keycode = getattr(event, "keycode", None)
+    if keycode in PHYSICAL_KEYCODES.get(letter.lower(), set()):
+        return True
+
+    keysym = getattr(event, "keysym", "").lower()
+    char = getattr(event, "char", "").lower()
+    return keysym == letter.lower() or char == letter.lower()
+
+
+def is_hotkey(key_code: int, letter: str) -> bool:
+    if key_code < 0:
+        return False
+
+    letter = letter.lower()
+    if key_code == ord(letter):
+        return True
+
+    physical_vk = {
+        "q": 0x51,
+        "c": 0x43,
+        "m": 0x4D,
+        "r": 0x52,
+    }
+    if key_code == physical_vk.get(letter, -1):
+        return True
+
+    if 32 <= key_code <= 126:
+        try:
+            return chr(key_code).lower() == letter
+        except ValueError:
+            return False
+
+    return False
+
+
 class RussianArgumentParser(argparse.ArgumentParser):
     def format_usage(self) -> str:
         return super().format_usage().replace("usage:", "использование:")
@@ -1711,12 +1755,7 @@ class GazeStudioApp:
         self._build_menu()
         self._build_layout()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.root.bind("<Control-q>", lambda _event: self.close())
-        self.root.bind("<F5>", lambda _event: self.start())
-        self.root.bind("<F6>", lambda _event: self.stop())
-        self.root.bind("<Control-r>", lambda _event: self.reset_calibration())
-        self.root.bind("c", lambda _event: self.start_calibration())
-        self.root.bind("m", lambda _event: self.toggle_cursor_control())
+        self.root.bind_all("<KeyPress>", self.handle_hotkeys, add="+")
         self.root.bind_all("<Control-Shift-M>", lambda _event: self.disable_cursor_control())
         self.root.after(100, self.start)
 
@@ -2071,6 +2110,30 @@ class GazeStudioApp:
         cv2.destroyAllWindows()
         self.root.destroy()
 
+    def handle_hotkeys(self, event: tk.Event) -> None:
+        if event.state & 0x4 and hotkey_matches(event, "q"):
+            self.close()
+            return
+        if hotkey_matches(event, "q"):
+            if self.calibration.active:
+                self.reset_calibration()
+            return
+        if event.keysym == "F5":
+            self.start()
+            return
+        if event.keysym == "F6":
+            self.stop()
+            return
+        if event.state & 0x4 and hotkey_matches(event, "r"):
+            self.reset_calibration()
+            return
+        if hotkey_matches(event, "c"):
+            self.start_calibration()
+            return
+        if hotkey_matches(event, "m"):
+            self.toggle_cursor_control()
+            return
+
     def run(self) -> None:
         self.root.mainloop()
 
@@ -2177,15 +2240,24 @@ def run(
             )
             cv2.imshow(window_name, result.frame)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
+            key = cv2.waitKeyEx(1)
+            if is_hotkey(key, "q"):
+                if calibration.active:
+                    calibration.stop()
+                    cursor.mapper = None
+                    cursor.reset_motion()
+                    try:
+                        cv2.destroyWindow(calibration_window)
+                    except cv2.error:
+                        pass
+                    continue
                 break
-            if key == ord("c"):
+            if is_hotkey(key, "c"):
                 if not calibration.active:
                     calibration.start()
-            if key == ord("m"):
+            if is_hotkey(key, "m"):
                 cursor.toggle()
-            if key == ord("r"):
+            if is_hotkey(key, "r"):
                 calibration.stop()
                 cursor.mapper = None
                 cursor.reset_motion()
