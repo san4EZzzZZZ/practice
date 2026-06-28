@@ -1066,13 +1066,52 @@ def draw_hud(
     footer = f"C калибровка   M курсор   R сброс   Q выход   {cursor_hint}"
     put_text(frame, footer, (margin, height - 14), 0.46, COLOR_TEXT)
 
+def estimate_head_pose(landmarks, frame_width, frame_height):
+    # 3D координаты эталонной модели лица
+    model_points = np.array([
+        (0.0, 0.0, 0.0),             # Кончик носа
+        (0.0, -330.0, -65.0),        # Подбородок
+        (-225.0, 170.0, -135.0),     # Левый глаз, левый угол
+        (225.0, 170.0, -135.0),      # Правый глаз, правый угол
+        (-150.0, -150.0, -125.0),    # Левый угол рта
+        (150.0, -150.0, -125.0)      # Правый угол рта
+    ], dtype=np.float32)
 
-def process_frame(
-    frame: np.ndarray,
-    face_landmarker,
-    estimator: GazeEstimator,
-    flip: bool = True,
-) -> FrameResult:
+    image_points = np.array([
+        (landmarks[1].x * frame_width, landmarks[1].y * frame_height),
+        (landmarks[152].x * frame_width, landmarks[152].y * frame_height),
+        (landmarks[33].x * frame_width, landmarks[33].y * frame_height),
+        (landmarks[263].x * frame_width, landmarks[263].y * frame_height),
+        (landmarks[61].x * frame_width, landmarks[61].y * frame_height),
+        (landmarks[291].x * frame_width, landmarks[291].y * frame_height)
+    ], dtype=np.float32)
+
+    focal_length = frame_width
+    center = (frame_width / 2, frame_height / 2)
+    camera_matrix = np.array([
+        [focal_length, 0, center[0]],
+        [0, focal_length, center[1]],
+        [0, 0, 1]
+    ], dtype=np.float32)
+
+    dist_coeffs = np.zeros((4, 1))
+
+    success, rotation_vector, translation_vector = cv2.solvePnP(
+        model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+    )
+
+    rmat, _ = cv2.Rodrigues(rotation_vector)
+    
+    # Исправленная распаковка: decomposeProjectionMatrix возвращает 7 параметров
+    # Нам нужен последний (7-й) — это углы Эйлера
+    proj_matrix = np.hstack((rmat, translation_vector))
+    decomp = cv2.decomposeProjectionMatrix(proj_matrix)
+    angles = decomp[6] # Индекс 6 — это eulerAngles
+    
+    pitch, yaw, roll = angles.flatten()[:3]
+    return pitch, yaw, roll
+
+def process_frame(frame, face_landmarker, estimator, flip=True):
     if flip:
         frame = cv2.flip(frame, 1)
     frame_height, frame_width = frame.shape[:2]
@@ -1080,37 +1119,49 @@ def process_frame(
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     landmark_result = face_landmarker.detect(mp_image)
 
-    gaze_results: list[GazeResult] = []
-
+    ratio_x, ratio_y, confidence = None, None, 0.0
+    eyes_count = 0
+    
     if landmark_result.face_landmarks:
         landmarks = landmark_result.face_landmarks[0]
-        for eye_indexes, iris_indexes in (
-            (LEFT_EYE_CONTOUR, LEFT_IRIS),
-            (RIGHT_EYE_CONTOUR, RIGHT_IRIS),
-        ):
-            result, eye_points = estimate_eye_from_landmarks(
-                landmarks,
-                eye_indexes,
-                iris_indexes,
-                frame_width,
-                frame_height,
-            )
-            gaze_results.append(result)
-            draw_landmark_eye(frame, eye_points, result)
+        
+        # --- НОВОЕ: Считаем поворот головы ---
+        pitch, yaw, roll = estimate_head_pose(landmarks, frame_width, frame_height)
+        
+        gaze_results = []
+        for eye_indexes, iris_indexes in ((LEFT_EYE_CONTOUR, LEFT_IRIS), (RIGHT_EYE_CONTOUR, RIGHT_IRIS)):
+            res, eye_points = estimate_eye_from_landmarks(landmarks, eye_indexes, iris_indexes, frame_width, frame_height)
+            gaze_results.append(res)
+            draw_landmark_eye(frame, eye_points, res)
 
-    ratio_x, ratio_y, confidence = average_gaze(gaze_results)
+        raw_ratio_x, raw_ratio_y, confidence = average_gaze(gaze_results)
+        eyes_count = len(gaze_results)
+
+        if raw_ratio_x is not None:
+            # Смена знака: с + на - (или наоборот, если у вас был минус)
+            # Если при повороте головы вправо точка улетает ВЛЕВО, ставим МИНУС.
+            # Если при повороте головы вправо точка улетает еще дальше ВПРАВО, ставим ПЛЮС.
+            
+            ratio_x = raw_ratio_x - (yaw * 0.007)  # Поменяли знак здесь
+            
+            # Если верх-вниз тоже перепутаны, поменяйте знак и тут:
+            ratio_y = raw_ratio_y - (pitch * 0.007) 
+            
+            # Ограничение
+            ratio_x = float(np.clip(ratio_x, 0.0, 1.0))
+            ratio_y = float(np.clip(ratio_y, 0.0, 1.0))
+
     raw_direction, stable_direction = estimator.analyze(ratio_x, ratio_y, confidence)
 
-    result = FrameResult(
+    return FrameResult(
         frame=frame,
         raw_direction=raw_direction,
         stable_direction=stable_direction,
         ratio_x=ratio_x,
         ratio_y=ratio_y,
         confidence=confidence,
-        eyes_found=len(gaze_results),
+        eyes_found=eyes_count,
     )
-    return result
 
 
 def draw_image_summary(frame: np.ndarray, result: FrameResult) -> None:
