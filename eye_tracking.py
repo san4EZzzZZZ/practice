@@ -849,7 +849,7 @@ class CalibrationSession:
         put_text_box(
             frame,
             "Смотрите на маркер и держите голову ровно",
-            (panel_x + 24, panel_y + 60, panel_x + panel_w - 24, panel_y + 90),
+            (panel_x + 24, panel_y + 58, panel_x + panel_w - 24, panel_y + 86),
             0.50,
             COLOR_MUTED,
             align="center",
@@ -857,7 +857,7 @@ class CalibrationSession:
         put_text_box(
             frame,
             self.progress_label(),
-            (panel_x + 24, panel_y + 92, panel_x + panel_w - 24, panel_y + 122),
+            (panel_x + 24, panel_y + 82, panel_x + panel_w - 24, panel_y + 112),
             0.58,
             COLOR_ACCENT,
             2,
@@ -874,7 +874,7 @@ class CalibrationSession:
             cv2.circle(frame, (target_x, target_y), 5, COLOR_TEXT, -1, cv2.LINE_AA)
 
             bar_x = panel_x + 24
-            bar_y = panel_y + 148
+            bar_y = panel_y + 128
             bar_w = panel_w - 48
             fill = float(np.clip(self.point_frames / max(1, self.settle_frames), 0.0, 1.0))
             draw_progress_bar(frame, "стабилизация", fill, (bar_x, bar_y), bar_w, marker_color)
@@ -882,7 +882,7 @@ class CalibrationSession:
                 frame,
                 "образцы",
                 self.point_samples / max(1, self.samples_per_point),
-                (bar_x, bar_y + 42),
+                (bar_x, bar_y + 46),
                 bar_w,
                 COLOR_BLUE,
             )
@@ -1266,7 +1266,7 @@ def draw_progress_bar(
     value = float(np.clip(value, 0.0, 1.0))
     put_text(frame, label, (x, y), 0.42, COLOR_MUTED)
     put_text(frame, f"{int(value * 100):3d}%", (x + width - 42, y), 0.42, COLOR_MUTED)
-    bar_y = y + 10
+    bar_y = y + 20
     cv2.rectangle(frame, (x, bar_y), (x + width, bar_y + 8), COLOR_PANEL_2, -1)
     cv2.rectangle(frame, (x, bar_y), (x + int(width * value), bar_y + 8), accent, -1)
     cv2.rectangle(frame, (x, bar_y), (x + width, bar_y + 8), COLOR_LINE, 1, cv2.LINE_AA)
