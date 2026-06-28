@@ -817,9 +817,25 @@ class CalibrationSession:
     def render(self) -> np.ndarray:
         frame = np.full((self.screen_h, self.screen_w, 3), 18, dtype=np.uint8)
         panel_w = min(560, self.screen_w - 80)
-        panel_x = 40
-        panel_y = 34
-        draw_panel(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + 210), 0.92)
+        panel_h = 234
+        margin = 40
+
+        panel_x = margin
+        panel_y = margin
+        if self.active:
+            target_x, target_y = self.current_target()
+            overlap_margin = 36
+            if (
+                panel_x - overlap_margin <= target_x <= panel_x + panel_w + overlap_margin
+                and panel_y - overlap_margin <= target_y <= panel_y + panel_h + overlap_margin
+            ):
+                panel_x = self.screen_w - panel_w - margin
+                panel_y = margin
+
+        panel_x = int(np.clip(panel_x, margin, max(margin, self.screen_w - panel_w - margin)))
+        panel_y = int(np.clip(panel_y, margin, max(margin, self.screen_h - panel_h - margin)))
+
+        draw_panel(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h), 0.92)
 
         put_text_box(
             frame,
@@ -858,7 +874,7 @@ class CalibrationSession:
             cv2.circle(frame, (target_x, target_y), 5, COLOR_TEXT, -1, cv2.LINE_AA)
 
             bar_x = panel_x + 24
-            bar_y = panel_y + 144
+            bar_y = panel_y + 148
             bar_w = panel_w - 48
             fill = float(np.clip(self.point_frames / max(1, self.settle_frames), 0.0, 1.0))
             draw_progress_bar(frame, "стабилизация", fill, (bar_x, bar_y), bar_w, marker_color)
@@ -866,7 +882,7 @@ class CalibrationSession:
                 frame,
                 "образцы",
                 self.point_samples / max(1, self.samples_per_point),
-                (bar_x, bar_y + 38),
+                (bar_x, bar_y + 42),
                 bar_w,
                 COLOR_BLUE,
             )
@@ -1173,26 +1189,30 @@ def put_text_box(
         bbox = draw.textbbox((0, 0), text, font=font)
         text_w = bbox[2] - bbox[0]
         text_h = bbox[3] - bbox[1]
+        box_w = x2 - x1
+        box_h = y2 - y1
+        center_x = x1 + box_w / 2
+        center_y = y1 + box_h / 2
 
         if align == "center":
-            tx = x1 + max(0, (x2 - x1 - text_w) // 2)
+            tx = int(round(center_x - (bbox[0] + bbox[2]) / 2))
         elif align == "right":
             tx = x2 - text_w
         else:
             tx = x1
-        ty = y1 + max(0, (y2 - y1 - text_h) // 2) - bbox[1]
+        ty = int(round(center_y - (bbox[1] + bbox[3]) / 2))
         draw.text((tx, ty), text, font=font, fill=(color[2], color[1], color[0]))
         frame[:] = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         return
 
-    (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    (text_w, text_h), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
     if align == "center":
         tx = x1 + max(0, (x2 - x1 - text_w) // 2)
     elif align == "right":
         tx = x2 - text_w
     else:
         tx = x1
-    ty = y1 + max(text_h, (y2 - y1 + text_h) // 2)
+    ty = y1 + max(text_h, ((y2 - y1) + text_h) // 2)
     cv2.putText(
         frame,
         text,
