@@ -101,6 +101,9 @@ STATUS_LABELS = {
     "unmapped": "нет калибровки",
     "on": "вкл",
     "off": "выкл",
+    "direct": "прямой",
+    "relative": "относительный",
+    "calibrated": "калиброванный",
     "calibrating": "калибровка",
     "paused": "пауза",
     "need calibration": "нужна калибровка",
@@ -109,6 +112,24 @@ STATUS_LABELS = {
     "tracking": "отслеживание",
     "inactive": "неактивна",
 }
+
+CURSOR_MODE_LABELS = {
+    "direct": "Прямой",
+    "relative": "Относительный",
+    "calibrated": "Калиброванный",
+}
+
+CURSOR_MODE_VALUES = tuple(CURSOR_MODE_LABELS.keys())
+CURSOR_MODE_LABEL_TO_VALUE = {label: value for value, label in CURSOR_MODE_LABELS.items()}
+
+GAZE_ALGORITHM_LABELS = {
+    "threshold": "Пороговый",
+    "majority": "Сглаженный",
+    "adaptive": "Адаптивный",
+}
+
+GAZE_ALGORITHM_VALUES = tuple(GAZE_ALGORITHM_LABELS.keys())
+GAZE_ALGORITHM_LABEL_TO_VALUE = {label: value for value, label in GAZE_ALGORITHM_LABELS.items()}
 
 
 def direction_label(direction: str) -> str:
@@ -130,10 +151,15 @@ class RussianArgumentParser(argparse.ArgumentParser):
 
 
 class GazeEstimator:
-    def __init__(self, history_size: int = 9) -> None:
+    def __init__(self, history_size: int = 9, algorithm: str = "threshold") -> None:
         self.center_x = 0.5
         self.center_y = 0.5
         self.history: deque[str] = deque(maxlen=history_size)
+        self.algorithm = algorithm if algorithm in GAZE_ALGORITHM_VALUES else "threshold"
+
+    def set_algorithm(self, algorithm: str) -> None:
+        self.algorithm = algorithm
+        self.history.clear()
 
     def calibrate(self, ratio_x: float | None, ratio_y: float | None) -> bool:
         if ratio_x is None or ratio_y is None:
@@ -181,6 +207,29 @@ class GazeEstimator:
             return "unknown"
 
         return Counter(self.history).most_common(1)[0][0]
+
+    def analyze(self, ratio_x: float | None, ratio_y: float | None, confidence: float) -> tuple[str, str]:
+        raw_direction = self.classify(ratio_x, ratio_y)
+
+        if self.algorithm == "threshold":
+            stable_direction = raw_direction
+        elif self.algorithm == "majority":
+            if raw_direction != "unknown":
+                self.history.append(raw_direction)
+            if not self.history:
+                stable_direction = "unknown"
+            else:
+                stable_direction = Counter(self.history).most_common(1)[0][0]
+        elif self.algorithm == "adaptive" and ratio_x is not None and ratio_y is not None and confidence >= 0.45:
+            if raw_direction == "center":
+                self.center_x = self.center_x * 0.94 + ratio_x * 0.06
+                self.center_y = self.center_y * 0.94 + ratio_y * 0.06
+                self.history.clear()
+            stable_direction = self.smooth(raw_direction)
+        else:
+            stable_direction = self.smooth(raw_direction)
+
+        return raw_direction, stable_direction
 
 
 class CsvLogger:
@@ -316,7 +365,7 @@ class ScreenMapper:
         screen_axis_y = np.array([item[1] for item in axis_y], dtype=np.float32)
         if len(gaze_axis_x) < 3 or len(gaze_axis_y) < 3:
             raise RuntimeError("Калибровка не собрала все области экрана.")
-        if float(np.min(np.diff(gaze_axis_x))) < 0.012 or float(np.min(np.diff(gaze_axis_y))) < 0.012:
+        if float(np.min(np.diff(gaze_axis_x))) < 0.010 or float(np.min(np.diff(gaze_axis_y))) < 0.010:
             raise RuntimeError(
                 "Калибровка получилась слишком слабой: взгляд почти не отличался между точками. "
                 "Пройдите ее заново, глядя точно в центр каждого маркера."
@@ -330,11 +379,13 @@ class CursorController:
         active_by_default: bool,
         smoothing: float,
         min_confidence: float,
+        mode: str,
     ) -> None:
         self.available = hasattr(ctypes, "windll")
         self.active = active_by_default and self.available
         self.smoothing = smoothing
         self.min_confidence = min_confidence
+        self.mode = mode if mode in CURSOR_MODE_VALUES else "direct"
         self.mapper: ScreenMapper | None = None
         self.user32 = ctypes.windll.user32 if self.available else None
         self.current_x: float | None = None
@@ -343,6 +394,8 @@ class CursorController:
         self.gaze_y: float | None = None
         self.target_x: float | None = None
         self.target_y: float | None = None
+        self.relative_origin_x: float | None = None
+        self.relative_origin_y: float | None = None
         self.gaze_history: deque[tuple[float, float]] = deque(maxlen=5)
 
     def toggle(self) -> None:
@@ -353,9 +406,11 @@ class CursorController:
     def status(self) -> str:
         if not self.available:
             return "unavailable"
+        if not self.active:
+            return "off"
         if self.mapper is None:
-            return "unmapped"
-        return "on" if self.active else "off"
+            return "need calibration" if self.mode == "calibrated" else self.mode
+        return "on"
 
     def movement_status(self, result: FrameResult, calibration_active: bool) -> str:
         if calibration_active:
@@ -365,7 +420,7 @@ class CursorController:
         if not self.active:
             return "paused"
         if self.mapper is None:
-            return "need calibration"
+            return "need calibration" if self.mode == "calibrated" else self.mode
         if result.ratio_x is None or result.ratio_y is None:
             return "no gaze"
         if result.confidence < self.min_confidence:
@@ -378,6 +433,10 @@ class CursorController:
         self.mapper = mapper
         self.reset_motion()
 
+    def set_mode(self, mode: str) -> None:
+        self.mode = mode
+        self.reset_motion()
+
     def reset_motion(self) -> None:
         self.current_x = None
         self.current_y = None
@@ -385,6 +444,8 @@ class CursorController:
         self.gaze_y = None
         self.target_x = None
         self.target_y = None
+        self.relative_origin_x = None
+        self.relative_origin_y = None
         self.gaze_history.clear()
 
     def move(
@@ -393,7 +454,7 @@ class CursorController:
         ratio_y: float | None,
         confidence: float,
     ) -> None:
-        if not self.available or not self.active or self.mapper is None:
+        if not self.available or not self.active:
             return
         if ratio_x is None or ratio_y is None or confidence < self.min_confidence:
             self.gaze_x = None
@@ -418,7 +479,31 @@ class CursorController:
 
         screen_w = self.user32.GetSystemMetrics(0)
         screen_h = self.user32.GetSystemMetrics(1)
-        target_x, target_y = self.mapper.map(self.gaze_x, self.gaze_y, screen_w, screen_h)
+        if self.mapper is not None:
+            target_x, target_y = self.mapper.map(self.gaze_x, self.gaze_y, screen_w, screen_h)
+        elif self.mode == "relative":
+            if self.relative_origin_x is None or self.relative_origin_y is None:
+                self.relative_origin_x = self.gaze_x
+                self.relative_origin_y = self.gaze_y
+            offset_x = self.gaze_x - self.relative_origin_x
+            offset_y = self.gaze_y - self.relative_origin_y
+            if abs(offset_x) < 0.015:
+                offset_x = 0.0
+            if abs(offset_y) < 0.015:
+                offset_y = 0.0
+            if self.current_x is None or self.current_y is None:
+                target_x = screen_w / 2 + offset_x * screen_w * 1.6
+                target_y = screen_h / 2 + offset_y * screen_h * 1.6
+            else:
+                target_x = self.current_x + offset_x * screen_w * 1.6
+                target_y = self.current_y + offset_y * screen_h * 1.6
+            self.relative_origin_x = self.relative_origin_x * 0.985 + self.gaze_x * 0.015
+            self.relative_origin_y = self.relative_origin_y * 0.985 + self.gaze_y * 0.015
+        elif self.mode == "direct":
+            target_x = self.gaze_x * screen_w
+            target_y = self.gaze_y * screen_h
+        else:
+            return
 
         if self.target_x is None or self.target_y is None:
             self.target_x = float(target_x)
@@ -480,8 +565,8 @@ class CalibrationSession:
         screen_w: int,
         screen_h: int,
         samples_per_point: int,
-        settle_frames: int = 16,
-        sample_stride: int = 3,
+        settle_frames: int = 10,
+        sample_stride: int = 2,
     ) -> None:
         self.screen_w = screen_w
         self.screen_h = screen_h
@@ -545,7 +630,7 @@ class CalibrationSession:
         if not self.active or ratio_x is None or ratio_y is None:
             self.point_frames += 1
             return False
-        if confidence < 0.35:
+        if confidence < 0.30:
             self.point_frames += 1
             return False
 
@@ -986,8 +1071,10 @@ def process_frame(
     frame: np.ndarray,
     face_landmarker,
     estimator: GazeEstimator,
+    flip: bool = True,
 ) -> FrameResult:
-    frame = cv2.flip(frame, 1)
+    if flip:
+        frame = cv2.flip(frame, 1)
     frame_height, frame_width = frame.shape[:2]
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -1012,8 +1099,7 @@ def process_frame(
             draw_landmark_eye(frame, eye_points, result)
 
     ratio_x, ratio_y, confidence = average_gaze(gaze_results)
-    raw_direction = estimator.classify(ratio_x, ratio_y)
-    stable_direction = estimator.smooth(raw_direction)
+    raw_direction, stable_direction = estimator.analyze(ratio_x, ratio_y, confidence)
 
     result = FrameResult(
         frame=frame,
@@ -1027,14 +1113,111 @@ def process_frame(
     return result
 
 
+def draw_image_summary(frame: np.ndarray, result: FrameResult) -> None:
+    height, width = frame.shape[:2]
+    panel_w = min(420, max(300, width // 3))
+    panel_h = 152
+    margin = 16
+    draw_panel(frame, (margin, margin), (margin + panel_w, margin + panel_h), 0.80)
+
+    put_text(frame, "Поиск взгляда", (margin + 18, margin + 34), 0.66, COLOR_TEXT, 2)
+    put_text(frame, f"направление: {direction_label(result.stable_direction)}", (margin + 18, margin + 68), 0.44, COLOR_ACCENT)
+
+    if result.ratio_x is None or result.ratio_y is None:
+        put_text(frame, "глаз не найден", (margin + 18, margin + 100), 0.44, COLOR_MUTED)
+    else:
+        put_text(
+            frame,
+            f"координаты: x {result.ratio_x:.2f}  y {result.ratio_y:.2f}",
+            (margin + 18, margin + 100),
+            0.44,
+            COLOR_TEXT,
+        )
+        gaze_x = int(result.ratio_x * width)
+        gaze_y = int(result.ratio_y * height)
+        cv2.circle(frame, (gaze_x, gaze_y), 12, COLOR_ACCENT, 2, cv2.LINE_AA)
+        cv2.circle(frame, (gaze_x, gaze_y), 4, COLOR_ACCENT, -1, cv2.LINE_AA)
+        cv2.line(frame, (gaze_x - 16, gaze_y), (gaze_x + 16, gaze_y), COLOR_ACCENT, 1, cv2.LINE_AA)
+        cv2.line(frame, (gaze_x, gaze_y - 16), (gaze_x, gaze_y + 16), COLOR_ACCENT, 1, cv2.LINE_AA)
+
+    put_text(frame, f"уверенность: {int(result.confidence * 100)}%", (margin + 18, margin + 128), 0.44, COLOR_MUTED)
+
+
+def collect_image_paths(image_dir: Path) -> list[Path]:
+    allowed = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+    return sorted(
+        path
+        for path in image_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in allowed
+    )
+
+
+def output_path_for_image(source: Path, output_dir: Path | None) -> Path:
+    if output_dir is None:
+        return source.with_name(f"{source.stem}_gaze.png")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir / f"{source.stem}_gaze.png"
+
+
+def run_image_mode(
+    image_path: Path | None,
+    image_dir: Path | None,
+    output_dir: Path | None,
+    preview: bool,
+) -> None:
+    if (image_path is None) == (image_dir is None):
+        raise RuntimeError("Укажите либо --image, либо --image-dir.")
+
+    estimator = GazeEstimator()
+    face_landmarker = create_face_landmarker()
+
+    try:
+        if image_path is not None:
+            paths = [image_path]
+        else:
+            paths = collect_image_paths(image_dir)
+            if not paths:
+                raise RuntimeError("В указанной папке не найдено изображений.")
+
+        for source in paths:
+            estimator = GazeEstimator()
+            frame = cv2.imread(str(source))
+            if frame is None:
+                print(f"[skip] {source.name}: не удалось открыть файл")
+                continue
+
+            result = process_frame(frame, face_landmarker, estimator, flip=False)
+            draw_image_summary(result.frame, result)
+
+            if output_dir is None:
+                target = output_path_for_image(source, None if image_path is not None else source.parent / "gaze_annotated")
+            else:
+                target = output_path_for_image(source, output_dir)
+
+            cv2.imwrite(str(target), result.frame)
+            direction = direction_label(result.stable_direction)
+            coords = "--, --" if result.ratio_x is None or result.ratio_y is None else f"{result.ratio_x:.2f}, {result.ratio_y:.2f}"
+            print(f"{source.name} -> {target.name} | {direction} | {coords} | {int(result.confidence * 100)}%")
+
+            if preview and image_path is not None:
+                cv2.imshow("Поиск взгляда", result.frame)
+                cv2.waitKey(0)
+                cv2.destroyWindow("Поиск взгляда")
+    finally:
+        face_landmarker.close()
+        cv2.destroyAllWindows()
+
+
 class GazeStudioApp:
     def __init__(
         self,
         camera_index: int,
         log_path: Path | None,
         control_cursor: bool,
+        gaze_algorithm: str,
         cursor_smoothing: float,
         cursor_min_confidence: float,
+        cursor_mode: str,
         calibration_samples: int,
     ) -> None:
         self.root = tk.Tk()
@@ -1048,8 +1231,8 @@ class GazeStudioApp:
         self.camera = None
         self.face_landmarker = None
         self.logger: CsvLogger | None = None
-        self.estimator = GazeEstimator()
-        self.cursor = CursorController(control_cursor, cursor_smoothing, cursor_min_confidence)
+        self.estimator = GazeEstimator(algorithm=gaze_algorithm)
+        self.cursor = CursorController(control_cursor, cursor_smoothing, cursor_min_confidence, cursor_mode)
         self.screen_w, self.screen_h = get_screen_size()
         self.calibration = CalibrationSession(self.screen_w, self.screen_h, calibration_samples)
         self.calibration_window: tk.Toplevel | None = None
@@ -1060,6 +1243,7 @@ class GazeStudioApp:
         self.closed = False
 
         self.cursor_enabled = tk.BooleanVar(value=control_cursor)
+        self.gaze_algorithm_var = tk.StringVar(value=GAZE_ALGORITHM_LABELS.get(gaze_algorithm, GAZE_ALGORITHM_LABELS["threshold"]))
         self.log_enabled = tk.BooleanVar(value=log_path is not None)
         self.smoothing = tk.DoubleVar(value=cursor_smoothing)
         self.min_confidence = tk.DoubleVar(value=cursor_min_confidence)
@@ -1071,6 +1255,7 @@ class GazeStudioApp:
         self.cursor_var = tk.StringVar(value=status_label(self.cursor.status()))
         self.motion_var = tk.StringVar(value="пауза")
         self.calibration_var = tk.StringVar(value="неактивна")
+        self.algorithm_var = tk.StringVar(value=self.gaze_algorithm_var.get())
         self.status_var = tk.StringVar(value="Готово")
 
         self._build_style()
@@ -1083,8 +1268,7 @@ class GazeStudioApp:
         self.root.bind("<Control-r>", lambda _event: self.reset_calibration())
         self.root.bind("c", lambda _event: self.start_calibration())
         self.root.bind("m", lambda _event: self.toggle_cursor_control())
-        self.root.bind("r", lambda _event: self.reset_calibration())
-        self.root.bind("q", lambda _event: self.close())
+        self.root.bind_all("<Control-Shift-M>", lambda _event: self.disable_cursor_control())
         self.root.after(100, self.start)
 
     def _build_style(self) -> None:
@@ -1114,6 +1298,11 @@ class GazeStudioApp:
             label="Управление курсором",
             variable=self.cursor_enabled,
             command=self.apply_cursor_toggle,
+        )
+        tracking_menu.add_command(
+            label="Выключить управление курсором",
+            command=self.disable_cursor_control,
+            accelerator="Ctrl+Shift+M",
         )
         menu.add_cascade(label="Отслеживание", menu=tracking_menu)
 
@@ -1157,6 +1346,7 @@ class GazeStudioApp:
         self._add_status_row(status_box, 6, "Курсор", self.cursor_var)
         self._add_status_row(status_box, 7, "Движение", self.motion_var)
         self._add_status_row(status_box, 8, "Калибровка", self.calibration_var)
+        self._add_status_row(status_box, 9, "Алгоритм", self.algorithm_var)
 
         control_box = ttk.LabelFrame(side, text="Управление")
         control_box.grid(row=1, column=0, sticky="ew", pady=(10, 0))
@@ -1172,12 +1362,21 @@ class GazeStudioApp:
             variable=self.cursor_enabled,
             command=self.apply_cursor_toggle,
         ).grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 4))
+        ttk.Label(control_box, text="Алгоритм слежения за взглядом").grid(row=3, column=0, sticky="w", padx=8, pady=(6, 0))
+        self.gaze_algorithm_box = ttk.Combobox(
+            control_box,
+            textvariable=self.gaze_algorithm_var,
+            values=list(GAZE_ALGORITHM_LABELS.values()),
+            state="readonly",
+        )
+        self.gaze_algorithm_box.grid(row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 4))
+        self.gaze_algorithm_box.bind("<<ComboboxSelected>>", self.apply_gaze_algorithm)
         ttk.Checkbutton(
             control_box,
             text="Записывать CSV-журнал",
             variable=self.log_enabled,
             command=self.apply_logging_toggle,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=4)
 
         settings_box = ttk.LabelFrame(side, text="Настройки")
         settings_box.grid(row=2, column=0, sticky="ew", pady=(10, 0))
@@ -1207,8 +1406,18 @@ class GazeStudioApp:
         self.cursor.reset_motion()
         self.cursor_var.set(status_label(self.cursor.status()))
 
+    def apply_gaze_algorithm(self, _event=None) -> None:
+        selected_label = self.gaze_algorithm_var.get()
+        selected_algorithm = GAZE_ALGORITHM_LABEL_TO_VALUE.get(selected_label, "threshold")
+        self.estimator.set_algorithm(selected_algorithm)
+        self.algorithm_var.set(selected_label)
+
     def toggle_cursor_control(self) -> None:
         self.cursor_enabled.set(not self.cursor_enabled.get())
+        self.apply_cursor_toggle()
+
+    def disable_cursor_control(self) -> None:
+        self.cursor_enabled.set(False)
         self.apply_cursor_toggle()
 
     def apply_logging_toggle(self) -> None:
@@ -1345,6 +1554,7 @@ class GazeStudioApp:
         self.cursor_var.set(status_label(self.cursor.status()))
         self.motion_var.set(status_label(self.cursor.movement_status(result, self.calibration.active)))
         self.calibration_var.set(self.calibration.progress_label())
+        self.algorithm_var.set(GAZE_ALGORITHM_LABELS.get(self.estimator.algorithm, self.estimator.algorithm))
 
     def frame_to_photo(self, frame: np.ndarray, max_w: int, max_h: int) -> tk.PhotoImage:
         height, width = frame.shape[:2]
@@ -1387,16 +1597,20 @@ def run_desktop_app(
     camera_index: int,
     log_path: Path | None,
     control_cursor: bool,
+    gaze_algorithm: str,
     cursor_smoothing: float,
     cursor_min_confidence: float,
+    cursor_mode: str,
     calibration_samples: int,
 ) -> None:
     app = GazeStudioApp(
         camera_index=camera_index,
         log_path=log_path,
         control_cursor=control_cursor,
+        gaze_algorithm=gaze_algorithm,
         cursor_smoothing=cursor_smoothing,
         cursor_min_confidence=cursor_min_confidence,
+        cursor_mode=cursor_mode,
         calibration_samples=calibration_samples,
     )
     app.run()
@@ -1406,16 +1620,19 @@ def run(
     camera_index: int,
     log_path: Path | None,
     control_cursor: bool,
+    gaze_algorithm: str,
     cursor_smoothing: float,
     cursor_min_confidence: float,
+    cursor_mode: str,
     calibration_samples: int,
 ) -> None:
-    estimator = GazeEstimator()
+    estimator = GazeEstimator(algorithm=gaze_algorithm)
     logger = CsvLogger(log_path)
     cursor = CursorController(
         active_by_default=control_cursor,
         smoothing=cursor_smoothing,
         min_confidence=cursor_min_confidence,
+        mode=cursor_mode,
     )
     face_landmarker = create_face_landmarker()
     screen_w, screen_h = get_screen_size()
@@ -1496,7 +1713,7 @@ def parse_args() -> argparse.Namespace:
         description="Демонстрационная система отслеживания взгляда через веб-камеру.",
         add_help=False,
     )
-    parser.usage = "%(prog)s [-h] [--camera CAMERA] [--log LOG] [--control-cursor] [--cursor-smoothing VALUE] [--cursor-min-confidence VALUE] [--calibration-samples N] [--opencv-ui]"
+    parser.usage = "%(prog)s [-h] [--camera CAMERA] [--log LOG] [--control-cursor] [--cursor-mode MODE] [--gaze-algorithm MODE] [--cursor-smoothing VALUE] [--cursor-min-confidence VALUE] [--calibration-samples N] [--opencv-ui] [--image IMAGE | --image-dir IMAGE_DIR] [--output-dir OUTPUT_DIR] [--preview]"
     parser._positionals.title = "позиционные аргументы"
     parser._optionals.title = "параметры"
     parser.add_argument(
@@ -1520,7 +1737,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--control-cursor",
         action="store_true",
-        help="Включить управление курсором взглядом после калибровки. Клавиша M переключает режим.",
+        help="Включить управление курсором взглядом сразу, без калибровки. Клавиша M переключает режим.",
+    )
+    parser.add_argument(
+        "--gaze-algorithm",
+        choices=GAZE_ALGORITHM_VALUES,
+        default="threshold",
+        help="Алгоритм слежения за взглядом: threshold, majority или adaptive.",
+    )
+    parser.add_argument(
+        "--cursor-mode",
+        choices=("direct", "relative", "calibrated"),
+        default="direct",
+        help="Алгоритм управления курсором: direct работает по сырым координатам, relative двигает курсор по отклонению, calibrated использует экранную калибровку.",
     )
     parser.add_argument(
         "--cursor-smoothing",
@@ -1537,7 +1766,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--calibration-samples",
         type=int,
-        default=10,
+        default=6,
         help="Количество стабильных образцов взгляда для каждой точки калибровки.",
     )
     parser.add_argument(
@@ -1545,17 +1774,50 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Использовать старый интерфейс OpenCV вместо настольного окна.",
     )
+    parser.add_argument(
+        "--image",
+        type=Path,
+        default=None,
+        help="Анализировать одно изображение вместо живой камеры.",
+    )
+    parser.add_argument(
+        "--image-dir",
+        type=Path,
+        default=None,
+        help="Анализировать все изображения в папке.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Папка для сохранения размеченных изображений.",
+    )
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help="Показывать окно предпросмотра для одного изображения.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    runner = run if args.opencv_ui else run_desktop_app
-    runner(
-        camera_index=args.camera,
-        log_path=args.log,
-        control_cursor=args.control_cursor,
-        cursor_smoothing=float(np.clip(args.cursor_smoothing, 0.0, 0.95)),
-        cursor_min_confidence=float(np.clip(args.cursor_min_confidence, 0.0, 1.0)),
-        calibration_samples=max(4, args.calibration_samples),
-    )
+    if args.image is not None or args.image_dir is not None:
+        run_image_mode(
+            image_path=args.image,
+            image_dir=args.image_dir,
+            output_dir=args.output_dir,
+            preview=bool(args.preview),
+        )
+    else:
+        runner = run if args.opencv_ui else run_desktop_app
+        runner(
+            camera_index=args.camera,
+            log_path=args.log,
+            control_cursor=args.control_cursor,
+            gaze_algorithm=args.gaze_algorithm,
+            cursor_mode=args.cursor_mode,
+            cursor_smoothing=float(np.clip(args.cursor_smoothing, 0.0, 0.95)),
+            cursor_min_confidence=float(np.clip(args.cursor_min_confidence, 0.0, 1.0)),
+            calibration_samples=max(3, args.calibration_samples),
+        )
