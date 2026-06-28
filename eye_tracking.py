@@ -220,49 +220,34 @@ class CsvLogger:
 class ScreenMapper:
     def __init__(
         self,
-        coeffs_x: np.ndarray,
-        coeffs_y: np.ndarray,
-        axis_coeffs_x: np.ndarray,
-        axis_coeffs_y: np.ndarray,
-        gaze_center: np.ndarray,
-        gaze_scale: np.ndarray,
+        gaze_axis_x: np.ndarray,
+        screen_axis_x: np.ndarray,
+        gaze_axis_y: np.ndarray,
+        screen_axis_y: np.ndarray,
     ) -> None:
-        self.coeffs_x = coeffs_x
-        self.coeffs_y = coeffs_y
-        self.axis_coeffs_x = axis_coeffs_x
-        self.axis_coeffs_y = axis_coeffs_y
-        self.gaze_center = gaze_center
-        self.gaze_scale = gaze_scale
+        self.gaze_axis_x = gaze_axis_x
+        self.screen_axis_x = screen_axis_x
+        self.gaze_axis_y = gaze_axis_y
+        self.screen_axis_y = screen_axis_y
 
     @staticmethod
-    def features(gaze_x: float, gaze_y: float) -> np.ndarray:
-        return np.array(
-            [1.0, gaze_x, gaze_y, gaze_x * gaze_y, gaze_x * gaze_x, gaze_y * gaze_y],
-            dtype=np.float32,
-        )
+    def interp_axis(gaze_value: float, gaze_axis: np.ndarray, screen_axis: np.ndarray) -> float:
+        if len(gaze_axis) < 2:
+            return float(screen_axis[0])
 
-    def normalized_features(self, gaze_x: float, gaze_y: float) -> np.ndarray:
-        gaze = np.array([gaze_x, gaze_y], dtype=np.float32)
-        x, y = (gaze - self.gaze_center) / self.gaze_scale
-        return self.features(float(x), float(y))
+        if gaze_value <= float(gaze_axis[0]):
+            slope = (screen_axis[1] - screen_axis[0]) / max(1e-5, gaze_axis[1] - gaze_axis[0])
+            return float(screen_axis[0] + (gaze_value - gaze_axis[0]) * slope)
+
+        if gaze_value >= float(gaze_axis[-1]):
+            slope = (screen_axis[-1] - screen_axis[-2]) / max(1e-5, gaze_axis[-1] - gaze_axis[-2])
+            return float(screen_axis[-1] + (gaze_value - gaze_axis[-1]) * slope)
+
+        return float(np.interp(gaze_value, gaze_axis, screen_axis))
 
     def map(self, gaze_x: float, gaze_y: float, screen_w: int, screen_h: int) -> tuple[int, int]:
-        vector = self.normalized_features(gaze_x, gaze_y)
-        curved_x = float(np.dot(self.coeffs_x, vector))
-        curved_y = float(np.dot(self.coeffs_y, vector))
-        axis_x = float(self.axis_coeffs_x[0] * gaze_x + self.axis_coeffs_x[1])
-        axis_y = float(self.axis_coeffs_y[0] * gaze_y + self.axis_coeffs_y[1])
-
-        if abs(curved_x - axis_x) > screen_w * 0.30:
-            x = axis_x
-        else:
-            x = axis_x * 0.72 + curved_x * 0.28
-
-        if abs(curved_y - axis_y) > screen_h * 0.22:
-            y = axis_y
-        else:
-            y = axis_y * 0.82 + curved_y * 0.18
-
+        x = self.interp_axis(gaze_x, self.gaze_axis_x, self.screen_axis_x)
+        y = self.interp_axis(gaze_y, self.gaze_axis_y, self.screen_axis_y)
         return (
             int(np.clip(x, 0, screen_w - 1)),
             int(np.clip(y, 0, screen_h - 1)),
@@ -304,49 +289,39 @@ class ScreenMapper:
         samples: list[tuple[float, float, int, int]],
     ) -> "ScreenMapper":
         samples = cls.remove_target_outliers(samples)
-        grouped: dict[tuple[int, int], list[tuple[float, float, int, int]]] = {}
+        by_screen_x: dict[int, list[tuple[float, float, int, int]]] = {}
+        by_screen_y: dict[int, list[tuple[float, float, int, int]]] = {}
         for sample in samples:
-            grouped.setdefault((sample[2], sample[3]), []).append(sample)
-        target_medians = [
+            by_screen_x.setdefault(sample[2], []).append(sample)
+            by_screen_y.setdefault(sample[3], []).append(sample)
+
+        axis_x = sorted(
             (
                 float(np.median([sample[0] for sample in target_samples])),
-                float(np.median([sample[1] for sample in target_samples])),
-                target[0],
-                target[1],
+                float(screen_x),
             )
-            for target, target_samples in grouped.items()
-        ]
-        gaze_values = np.array([(gaze_x, gaze_y) for gaze_x, gaze_y, _, _ in samples], dtype=np.float32)
-        gaze_center = np.mean(gaze_values, axis=0)
-        gaze_scale = np.maximum(np.std(gaze_values, axis=0), np.array([0.035, 0.035], dtype=np.float32))
-        matrix = np.array(
-            [
-                cls.features(
-                    float((gaze_x - gaze_center[0]) / gaze_scale[0]),
-                    float((gaze_y - gaze_center[1]) / gaze_scale[1]),
-                )
-                for gaze_x, gaze_y, _, _ in samples
-            ],
-            dtype=np.float32,
+            for screen_x, target_samples in by_screen_x.items()
         )
-        targets_x = np.array([screen_x for _, _, screen_x, _ in samples], dtype=np.float32)
-        targets_y = np.array([screen_y for _, _, _, screen_y in samples], dtype=np.float32)
+        axis_y = sorted(
+            (
+                float(np.median([sample[1] for sample in target_samples])),
+                float(screen_y),
+            )
+            for screen_y, target_samples in by_screen_y.items()
+        )
 
-        penalty = np.diag([0.0, 0.012, 0.012, 0.035, 0.035, 0.035]).astype(np.float32)
-        regularized_matrix = np.vstack([matrix, penalty])
-        regularized_x = np.concatenate([targets_x, np.zeros(matrix.shape[1], dtype=np.float32)])
-        regularized_y = np.concatenate([targets_y, np.zeros(matrix.shape[1], dtype=np.float32)])
-        coeffs_x, *_ = np.linalg.lstsq(regularized_matrix, regularized_x, rcond=None)
-        coeffs_y, *_ = np.linalg.lstsq(regularized_matrix, regularized_y, rcond=None)
-
-        median_gaze_x = np.array([sample[0] for sample in target_medians], dtype=np.float32)
-        median_gaze_y = np.array([sample[1] for sample in target_medians], dtype=np.float32)
-        median_screen_x = np.array([sample[2] for sample in target_medians], dtype=np.float32)
-        median_screen_y = np.array([sample[3] for sample in target_medians], dtype=np.float32)
-        axis_coeffs_x = np.polyfit(median_gaze_x, median_screen_x, 1).astype(np.float32)
-        axis_coeffs_y = np.polyfit(median_gaze_y, median_screen_y, 1).astype(np.float32)
-
-        return cls(coeffs_x, coeffs_y, axis_coeffs_x, axis_coeffs_y, gaze_center, gaze_scale)
+        gaze_axis_x = np.array([item[0] for item in axis_x], dtype=np.float32)
+        screen_axis_x = np.array([item[1] for item in axis_x], dtype=np.float32)
+        gaze_axis_y = np.array([item[0] for item in axis_y], dtype=np.float32)
+        screen_axis_y = np.array([item[1] for item in axis_y], dtype=np.float32)
+        if len(gaze_axis_x) < 3 or len(gaze_axis_y) < 3:
+            raise RuntimeError("Калибровка не собрала все области экрана.")
+        if float(np.min(np.diff(gaze_axis_x))) < 0.012 or float(np.min(np.diff(gaze_axis_y))) < 0.012:
+            raise RuntimeError(
+                "Калибровка получилась слишком слабой: взгляд почти не отличался между точками. "
+                "Пройдите ее заново, глядя точно в центр каждого маркера."
+            )
+        return cls(gaze_axis_x, screen_axis_x, gaze_axis_y, screen_axis_y)
 
 
 class CursorController:
@@ -368,7 +343,7 @@ class CursorController:
         self.gaze_y: float | None = None
         self.target_x: float | None = None
         self.target_y: float | None = None
-        self.target_history: deque[tuple[float, float]] = deque(maxlen=5)
+        self.gaze_history: deque[tuple[float, float]] = deque(maxlen=5)
 
     def toggle(self) -> None:
         if self.available:
@@ -410,7 +385,7 @@ class CursorController:
         self.gaze_y = None
         self.target_x = None
         self.target_y = None
-        self.target_history.clear()
+        self.gaze_history.clear()
 
     def move(
         self,
@@ -421,46 +396,54 @@ class CursorController:
         if not self.available or not self.active or self.mapper is None:
             return
         if ratio_x is None or ratio_y is None or confidence < self.min_confidence:
-            self.reset_motion()
+            self.gaze_x = None
+            self.gaze_y = None
+            self.target_x = None
+            self.target_y = None
+            self.gaze_history.clear()
             return
 
+        self.gaze_history.append((ratio_x, ratio_y))
+        stable_gaze = np.array(self.gaze_history, dtype=np.float32)
+        gaze_x = float(np.median(stable_gaze[:, 0]))
+        gaze_y = float(np.median(stable_gaze[:, 1]))
+
         if self.gaze_x is None or self.gaze_y is None:
-            self.gaze_x = ratio_x
-            self.gaze_y = ratio_y
+            self.gaze_x = gaze_x
+            self.gaze_y = gaze_y
         else:
-            gaze_delta = float(np.hypot(ratio_x - self.gaze_x, ratio_y - self.gaze_y))
-            gaze_alpha = 0.28 if gaze_delta > 0.08 else 0.55
-            self.gaze_x = self.gaze_x * gaze_alpha + ratio_x * (1.0 - gaze_alpha)
-            self.gaze_y = self.gaze_y * gaze_alpha + ratio_y * (1.0 - gaze_alpha)
+            gaze_alpha = 0.82
+            self.gaze_x = self.gaze_x * gaze_alpha + gaze_x * (1.0 - gaze_alpha)
+            self.gaze_y = self.gaze_y * gaze_alpha + gaze_y * (1.0 - gaze_alpha)
 
         screen_w = self.user32.GetSystemMetrics(0)
         screen_h = self.user32.GetSystemMetrics(1)
         target_x, target_y = self.mapper.map(self.gaze_x, self.gaze_y, screen_w, screen_h)
-        self.target_history.append((float(target_x), float(target_y)))
-        stable_targets = np.array(self.target_history, dtype=np.float32)
-        target_x = float(np.median(stable_targets[:, 0]))
-        target_y = float(np.median(stable_targets[:, 1]))
 
-        self.target_x = float(target_x)
-        self.target_y = float(target_y)
+        if self.target_x is None or self.target_y is None:
+            self.target_x = float(target_x)
+            self.target_y = float(target_y)
+        else:
+            target_alpha = 0.88
+            self.target_x = self.target_x * target_alpha + float(target_x) * (1.0 - target_alpha)
+            self.target_y = self.target_y * target_alpha + float(target_y) * (1.0 - target_alpha)
+
         alpha = float(np.clip(self.smoothing, 0.0, 0.95))
         if self.current_x is None or self.current_y is None:
-            self.current_x = self.target_x
-            self.current_y = self.target_y
-            self.user32.SetCursorPos(int(round(self.current_x)), int(round(self.current_y)))
-            return
+            point = ctypes.wintypes.POINT()
+            self.user32.GetCursorPos(ctypes.byref(point))
+            self.current_x = float(point.x)
+            self.current_y = float(point.y)
 
         distance = float(np.hypot(self.target_x - self.current_x, self.target_y - self.current_y))
-        if distance < 10:
+        if distance < 8:
             return
-        if distance > 520:
-            alpha = min(alpha, 0.38)
-        elif distance > 280:
-            alpha = min(alpha, 0.52)
-        elif distance > 120:
-            alpha = min(alpha, 0.68)
-        elif distance < 45:
-            alpha = max(alpha, 0.90)
+        if distance > 400:
+            alpha = min(alpha, 0.70)
+        elif distance > 200:
+            alpha = min(alpha, 0.80)
+        elif distance < 70:
+            alpha = max(alpha, 0.94)
 
         self.current_x = self.current_x * alpha + self.target_x * (1.0 - alpha)
         self.current_y = self.current_y * alpha + self.target_y * (1.0 - alpha)
@@ -497,8 +480,8 @@ class CalibrationSession:
         screen_w: int,
         screen_h: int,
         samples_per_point: int,
-        settle_frames: int = 18,
-        sample_stride: int = 2,
+        settle_frames: int = 16,
+        sample_stride: int = 3,
     ) -> None:
         self.screen_w = screen_w
         self.screen_h = screen_h
@@ -517,6 +500,7 @@ class CalibrationSession:
             (0.85, 0.5),
         ]
         self.active = False
+        self.completed = False
         self.target_index = 0
         self.samples: list[tuple[float, float, int, int]] = []
         self.point_samples = 0
@@ -525,6 +509,7 @@ class CalibrationSession:
 
     def start(self) -> None:
         self.active = True
+        self.completed = False
         self.target_index = 0
         self.samples.clear()
         self.point_samples = 0
@@ -539,6 +524,8 @@ class CalibrationSession:
         return int(ratio_x * self.screen_w), int(ratio_y * self.screen_h)
 
     def progress_label(self) -> str:
+        if self.completed:
+            return "завершена"
         if not self.active:
             return "неактивна"
         return (
@@ -552,7 +539,7 @@ class CalibrationSession:
         values = np.array(self.point_buffer, dtype=np.float32)
         spread_x = float(np.std(values[:, 0]))
         spread_y = float(np.std(values[:, 1]))
-        return spread_x < 0.045 and spread_y < 0.050
+        return spread_x < 0.040 and spread_y < 0.045
 
     def add_sample(self, ratio_x: float | None, ratio_y: float | None, confidence: float) -> bool:
         if not self.active or ratio_x is None or ratio_y is None:
@@ -582,6 +569,7 @@ class CalibrationSession:
             self.point_buffer.clear()
             if self.target_index >= len(self.targets):
                 self.active = False
+                self.completed = True
                 return True
         return False
 
@@ -1549,7 +1537,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--calibration-samples",
         type=int,
-        default=14,
+        default=10,
         help="Количество стабильных образцов взгляда для каждой точки калибровки.",
     )
     parser.add_argument(
