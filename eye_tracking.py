@@ -341,6 +341,7 @@ class CsvLogger:
     def __init__(self, path: Path | None) -> None:
         self.file = None
         self.writer = None
+        self.previous_stable_direction: str | None = None
 
         if path is None:
             return
@@ -354,8 +355,11 @@ class CsvLogger:
                 "stable_direction",
                 "ratio_x",
                 "ratio_y",
+                "confidence",
                 "eyes_found",
+                "gaze_valid",
                 "blink_detected",
+                "stable_changed",
             ]
         )
 
@@ -370,10 +374,17 @@ class CsvLogger:
                 result.stable_direction,
                 "" if result.ratio_x is None else f"{result.ratio_x:.4f}",
                 "" if result.ratio_y is None else f"{result.ratio_y:.4f}",
+                f"{result.confidence:.3f}",
                 result.eyes_found,
+                int(result.ratio_x is not None and result.ratio_y is not None),
                 int(result.blink_detected),
+                int(
+                    self.previous_stable_direction is not None
+                    and result.stable_direction != self.previous_stable_direction
+                ),
             ]
         )
+        self.previous_stable_direction = result.stable_direction
 
     def close(self) -> None:
         if self.file is not None:
