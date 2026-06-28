@@ -795,6 +795,7 @@ def estimate_eye_from_landmarks(
     landmarks,
     eye_indexes: list[int],
     iris_indexes: list[int],
+    frame_gray: np.ndarray,
     frame_width: int,
     frame_height: int,
 ) -> tuple[GazeResult, list[tuple[int, int]]]:
@@ -819,6 +820,35 @@ def estimate_eye_from_landmarks(
     ratio_x = float(np.clip((center_x - min_x) / width, 0.0, 1.0))
     ratio_y = float(np.clip((center_y - min_y) / height, 0.0, 1.0))
 
+    pad_x = max(6, int(width * 0.25))
+    pad_y = max(6, int(height * 0.35))
+    x1 = max(0, min_x - pad_x)
+    x2 = min(frame_width, max_x + pad_x + 1)
+    y1 = max(0, min_y - pad_y)
+    y2 = min(frame_height, max_y + pad_y + 1)
+
+    pupil_visibility = 0.0
+    if x2 > x1 and y2 > y1:
+        crop = frame_gray[y1:y2, x1:x2]
+        if crop.size > 0:
+            cx = float(center_x - x1)
+            cy = float(center_y - y1)
+            yy, xx = np.ogrid[: crop.shape[0], : crop.shape[1]]
+            dist2 = (xx - cx) ** 2 + (yy - cy) ** 2
+            center_radius = max(2.0, min(width, height) * 0.085)
+            ring_radius = max(center_radius + 2.0, min(width, height) * 0.22)
+            center_mask = dist2 <= center_radius * center_radius
+            ring_mask = (dist2 > center_radius * center_radius) & (dist2 <= ring_radius * ring_radius)
+            if np.any(center_mask) and np.any(ring_mask):
+                center_mean = float(np.mean(crop[center_mask]))
+                ring_mean = float(np.mean(crop[ring_mask]))
+                contrast_score = float(np.clip((ring_mean - center_mean - 2.5) / 12.0, 0.0, 1.0))
+                core_darkness = float(np.clip((155.0 - center_mean) / 115.0, 0.0, 1.0))
+                texture_score = float(np.clip((float(np.std(crop)) - 10.0) / 18.0, 0.0, 1.0))
+                pupil_visibility = float(
+                    np.clip(contrast_score * 0.55 + core_darkness * 0.30 + texture_score * 0.15, 0.0, 1.0)
+                )
+
     iris_center = np.mean(iris_array, axis=0)
     iris_spread = float(np.mean(np.linalg.norm(iris_array - iris_center, axis=1)))
     relative_spread = iris_spread / max(1.0, min(width, height))
@@ -827,11 +857,16 @@ def estimate_eye_from_landmarks(
     edge_quality = float(np.clip(edge_distance / 0.25, 0.0, 1.0))
     opening_quality = 1.0
     if openness_ratio is not None:
-        opening_quality = float(np.clip((openness_ratio - 0.14) / 0.16, 0.0, 1.0))
-        if opening_quality < 0.20:
+        opening_quality = float(np.clip((openness_ratio - 0.11) / 0.18, 0.0, 1.0))
+        if opening_quality < 0.08:
             return GazeResult("unknown", None, None, None, 0.0), eye_points
 
-    confidence = float(np.clip((spread_quality * 0.6 + edge_quality * 0.4) * opening_quality, 0.0, 1.0))
+    if pupil_visibility < 0.12:
+        return GazeResult("unknown", None, None, None, 0.0), eye_points
+
+    confidence = float(
+        np.clip((spread_quality * 0.55 + edge_quality * 0.25 + pupil_visibility * 0.20) * opening_quality, 0.0, 1.0)
+    )
 
     return (
         GazeResult(
@@ -1190,6 +1225,7 @@ def process_frame(frame, face_landmarker, estimator, flip=True):
         frame = cv2.flip(frame, 1)
     frame_height, frame_width = frame.shape[:2]
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     landmark_result = face_landmarker.detect(mp_image)
 
@@ -1201,7 +1237,14 @@ def process_frame(frame, face_landmarker, estimator, flip=True):
 
         gaze_results = []
         for eye_indexes, iris_indexes in ((LEFT_EYE_CONTOUR, LEFT_IRIS), (RIGHT_EYE_CONTOUR, RIGHT_IRIS)):
-            res, eye_points = estimate_eye_from_landmarks(landmarks, eye_indexes, iris_indexes, frame_width, frame_height)
+            res, eye_points = estimate_eye_from_landmarks(
+                landmarks,
+                eye_indexes,
+                iris_indexes,
+                gray,
+                frame_width,
+                frame_height,
+            )
             gaze_results.append(res)
             draw_landmark_eye(frame, eye_points, res)
 
