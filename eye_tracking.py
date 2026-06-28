@@ -81,6 +81,7 @@ COLOR_BLUE = (220, 170, 92)
 COLOR_LINE = (92, 94, 98)
 VIGNETTE_CACHE: dict[tuple[int, int], np.ndarray] = {}
 FONT_CACHE: dict[tuple[str, int], object] = {}
+MIN_EYE_AGGREGATION_CONFIDENCE = 0.20
 
 DIRECTION_LABELS = {
     "unknown": "неизвестно",
@@ -133,7 +134,7 @@ GAZE_ALGORITHM_LABEL_TO_VALUE = {label: value for value, label in GAZE_ALGORITHM
 
 
 def direction_label(direction: str) -> str:
-    return DIRECTION_LABELS.get(direction, direction).upper()
+    return DIRECTION_LABELS.get(direction, direction)
 
 
 def status_label(status: str) -> str:
@@ -175,18 +176,21 @@ class GazeEstimator:
             return "unknown"
 
         dx = ratio_x - self.center_x
-        dy = ratio_y - self.center_y
+        dy = self.center_y - ratio_y
 
-        if dx < -0.14:
+        if abs(dx) <= 0.12 and abs(dy) <= 0.07:
+            return "center"
+
+        if dx < -0.12:
             horizontal = "left"
-        elif dx > 0.14:
+        elif dx > 0.12:
             horizontal = "right"
         else:
             horizontal = "center"
 
-        if dy < -0.13:
+        if dy < -0.075:
             vertical = "up"
-        elif dy > 0.16:
+        elif dy > 0.075:
             vertical = "down"
         else:
             vertical = "center"
@@ -210,6 +214,10 @@ class GazeEstimator:
 
     def analyze(self, ratio_x: float | None, ratio_y: float | None, confidence: float) -> tuple[str, str]:
         raw_direction = self.classify(ratio_x, ratio_y)
+
+        if raw_direction == "center":
+            self.history.clear()
+            return raw_direction, raw_direction
 
         if self.algorithm == "threshold":
             stable_direction = raw_direction
@@ -770,9 +778,11 @@ def estimate_eye_from_landmarks(
 
     iris_center = np.mean(iris_array, axis=0)
     iris_spread = float(np.mean(np.linalg.norm(iris_array - iris_center, axis=1)))
-    confidence = float(
-        np.clip(iris_spread / max(1.0, min(width, height) * 0.18), 0.35, 1.0)
-    )
+    relative_spread = iris_spread / max(1.0, min(width, height))
+    spread_quality = float(np.exp(-((relative_spread - 0.09) / 0.035) ** 2))
+    edge_distance = float(min(ratio_x, 1.0 - ratio_x, ratio_y, 1.0 - ratio_y))
+    edge_quality = float(np.clip(edge_distance / 0.25, 0.0, 1.0))
+    confidence = float(np.clip(spread_quality * 0.6 + edge_quality * 0.4, 0.05, 1.0))
 
     return (
         GazeResult(
@@ -807,14 +817,26 @@ def draw_landmark_eye(
 
 
 def average_gaze(results: list[GazeResult]) -> tuple[float | None, float | None, float]:
-    known = [item for item in results if item.ratio_x is not None and item.ratio_y is not None]
+    known = [
+        item
+        for item in results
+        if item.ratio_x is not None
+        and item.ratio_y is not None
+        and item.confidence >= MIN_EYE_AGGREGATION_CONFIDENCE
+    ]
     if not known:
         return None, None, 0.0
 
     weights = np.array([max(0.1, item.confidence) for item in known], dtype=np.float32)
     xs = np.array([item.ratio_x for item in known], dtype=np.float32)
     ys = np.array([item.ratio_y for item in known], dtype=np.float32)
-    confidence = float(np.clip(np.mean([item.confidence for item in known]), 0.0, 1.0))
+    base_quality = float(np.clip(np.mean([item.confidence for item in known]), 0.0, 1.0))
+    agreement = 1.0
+    if len(known) >= 2:
+        dx = float(abs(xs[0] - xs[1]))
+        dy = float(abs(ys[0] - ys[1]))
+        agreement = float(np.clip(1.0 - max(dx, dy) / 0.35, 0.0, 1.0))
+    confidence = float(np.clip(base_quality * 0.65 + agreement * 0.35, 0.0, 1.0))
     return (
         float(np.average(xs, weights=weights)),
         float(np.average(ys, weights=weights)),
@@ -1124,10 +1146,7 @@ def process_frame(frame, face_landmarker, estimator, flip=True):
     
     if landmark_result.face_landmarks:
         landmarks = landmark_result.face_landmarks[0]
-        
-        # --- НОВОЕ: Считаем поворот головы ---
-        pitch, yaw, roll = estimate_head_pose(landmarks, frame_width, frame_height)
-        
+
         gaze_results = []
         for eye_indexes, iris_indexes in ((LEFT_EYE_CONTOUR, LEFT_IRIS), (RIGHT_EYE_CONTOUR, RIGHT_IRIS)):
             res, eye_points = estimate_eye_from_landmarks(landmarks, eye_indexes, iris_indexes, frame_width, frame_height)
@@ -1138,18 +1157,8 @@ def process_frame(frame, face_landmarker, estimator, flip=True):
         eyes_count = len(gaze_results)
 
         if raw_ratio_x is not None:
-            # Смена знака: с + на - (или наоборот, если у вас был минус)
-            # Если при повороте головы вправо точка улетает ВЛЕВО, ставим МИНУС.
-            # Если при повороте головы вправо точка улетает еще дальше ВПРАВО, ставим ПЛЮС.
-            
-            ratio_x = raw_ratio_x - (yaw * 0.007)  # Поменяли знак здесь
-            
-            # Если верх-вниз тоже перепутаны, поменяйте знак и тут:
-            ratio_y = raw_ratio_y - (pitch * 0.007) 
-            
-            # Ограничение
-            ratio_x = float(np.clip(ratio_x, 0.0, 1.0))
-            ratio_y = float(np.clip(ratio_y, 0.0, 1.0))
+            ratio_x = float(np.clip(raw_ratio_x, 0.0, 1.0))
+            ratio_y = float(np.clip(raw_ratio_y, 0.0, 1.0))
 
     raw_direction, stable_direction = estimator.analyze(ratio_x, ratio_y, confidence)
 
