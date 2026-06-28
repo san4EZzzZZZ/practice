@@ -823,9 +823,9 @@ class CalibrationSession:
 
         put_text_box(
             frame,
-            "Калибровка экрана",
-            (panel_x + 24, panel_y + 24, panel_x + panel_w - 24, panel_y + 58),
-            0.84,
+            "Калибровка",
+            (panel_x + 24, panel_y + 22, panel_x + panel_w - 24, panel_y + 60),
+            0.90,
             COLOR_TEXT,
             2,
             align="center",
@@ -833,7 +833,7 @@ class CalibrationSession:
         put_text_box(
             frame,
             "Смотрите на маркер и держите голову ровно",
-            (panel_x + 24, panel_y + 62, panel_x + panel_w - 24, panel_y + 90),
+            (panel_x + 24, panel_y + 60, panel_x + panel_w - 24, panel_y + 90),
             0.50,
             COLOR_MUTED,
             align="center",
@@ -841,7 +841,7 @@ class CalibrationSession:
         put_text_box(
             frame,
             self.progress_label(),
-            (panel_x + 24, panel_y + 96, panel_x + panel_w - 24, panel_y + 124),
+            (panel_x + 24, panel_y + 92, panel_x + panel_w - 24, panel_y + 122),
             0.58,
             COLOR_ACCENT,
             2,
@@ -1042,8 +1042,8 @@ def draw_landmark_eye(
 def draw_blink_effect(frame: np.ndarray) -> None:
     height, width = frame.shape[:2]
     blend_rect(frame, (0, 0), (width, height), (52, 96, 255), 0.08)
-    draw_panel(frame, (18, 18), (220, 74), 0.80)
-    put_text_box(frame, "моргание", (36, 28, 186, 62), 0.62, COLOR_WARN, 2, align="center")
+    draw_panel(frame, (18, 18), (248, 74), 0.80)
+    put_text_box(frame, "моргание", (18, 18, 248, 74), 0.58, COLOR_WARN, 2, align="center")
     cv2.circle(frame, (width - 54, 46), 14, COLOR_WARN, 2, cv2.LINE_AA)
     cv2.circle(frame, (width - 54, 46), 5, COLOR_WARN, -1, cv2.LINE_AA)
 
