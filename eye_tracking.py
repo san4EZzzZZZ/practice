@@ -127,6 +127,8 @@ GAZE_ALGORITHM_LABELS = {
     "threshold": "Пороговый",
     "majority": "Сглаженный",
     "adaptive": "Адаптивный",
+    "ema": "Экспоненциальный",
+    "hysteresis": "Гистерезисный",
 }
 
 GAZE_ALGORITHM_VALUES = tuple(GAZE_ALGORITHM_LABELS.keys())
@@ -156,11 +158,17 @@ class GazeEstimator:
         self.center_x = 0.5
         self.center_y = 0.5
         self.history: deque[str] = deque(maxlen=history_size)
+        self.ratio_history: deque[tuple[float, float]] = deque(maxlen=5)
+        self.direction_candidate: str | None = None
+        self.direction_candidate_count = 0
         self.algorithm = algorithm if algorithm in GAZE_ALGORITHM_VALUES else "threshold"
 
     def set_algorithm(self, algorithm: str) -> None:
         self.algorithm = algorithm
         self.history.clear()
+        self.ratio_history.clear()
+        self.direction_candidate = None
+        self.direction_candidate_count = 0
 
     def calibrate(self, ratio_x: float | None, ratio_y: float | None) -> bool:
         if ratio_x is None or ratio_y is None:
@@ -169,6 +177,9 @@ class GazeEstimator:
         self.center_x = ratio_x
         self.center_y = ratio_y
         self.history.clear()
+        self.ratio_history.clear()
+        self.direction_candidate = None
+        self.direction_candidate_count = 0
         return True
 
     def classify(self, ratio_x: float | None, ratio_y: float | None) -> str:
@@ -212,6 +223,42 @@ class GazeEstimator:
 
         return Counter(self.history).most_common(1)[0][0]
 
+    def smooth_ratios(self, ratio_x: float, ratio_y: float) -> tuple[float, float]:
+        self.ratio_history.append((ratio_x, ratio_y))
+        values = np.array(self.ratio_history, dtype=np.float32)
+        return float(np.mean(values[:, 0])), float(np.mean(values[:, 1]))
+
+    def apply_hysteresis(self, direction: str) -> str:
+        if direction == "unknown":
+            self.direction_candidate = None
+            self.direction_candidate_count = 0
+            return "unknown"
+
+        if direction == "center":
+            self.direction_candidate = None
+            self.direction_candidate_count = 0
+            self.history.clear()
+            return "center"
+
+        if self.direction_candidate == direction:
+            self.direction_candidate_count += 1
+        else:
+            self.direction_candidate = direction
+            self.direction_candidate_count = 1
+
+        current = self.history[-1] if self.history else "center"
+        if current == direction:
+            return direction
+
+        if self.direction_candidate_count >= 2:
+            self.history.clear()
+            self.history.append(direction)
+            self.direction_candidate = None
+            self.direction_candidate_count = 0
+            return direction
+
+        return current
+
     def analyze(self, ratio_x: float | None, ratio_y: float | None, confidence: float) -> tuple[str, str]:
         raw_direction = self.classify(ratio_x, ratio_y)
 
@@ -234,6 +281,13 @@ class GazeEstimator:
                 self.center_y = self.center_y * 0.94 + ratio_y * 0.06
                 self.history.clear()
             stable_direction = self.smooth(raw_direction)
+        elif self.algorithm == "ema" and ratio_x is not None and ratio_y is not None:
+            smooth_x, smooth_y = self.smooth_ratios(ratio_x, ratio_y)
+            blended_x = smooth_x * 0.68 + ratio_x * 0.32
+            blended_y = smooth_y * 0.68 + ratio_y * 0.32
+            stable_direction = self.classify(blended_x, blended_y)
+        elif self.algorithm == "hysteresis":
+            stable_direction = self.apply_hysteresis(raw_direction)
         else:
             stable_direction = self.smooth(raw_direction)
 
@@ -1236,6 +1290,7 @@ def process_frame(frame, face_landmarker, estimator, flip=True):
         landmarks = landmark_result.face_landmarks[0]
 
         gaze_results = []
+        valid_eyes = 0
         for eye_indexes, iris_indexes in ((LEFT_EYE_CONTOUR, LEFT_IRIS), (RIGHT_EYE_CONTOUR, RIGHT_IRIS)):
             res, eye_points = estimate_eye_from_landmarks(
                 landmarks,
@@ -1246,10 +1301,12 @@ def process_frame(frame, face_landmarker, estimator, flip=True):
                 frame_height,
             )
             gaze_results.append(res)
+            if res.direction != "unknown":
+                valid_eyes += 1
             draw_landmark_eye(frame, eye_points, res)
 
         raw_ratio_x, raw_ratio_y, confidence = average_gaze(gaze_results)
-        eyes_count = len(gaze_results)
+        eyes_count = valid_eyes
 
         if raw_ratio_x is not None:
             ratio_x = float(np.clip(raw_ratio_x, 0.0, 1.0))
@@ -1898,7 +1955,7 @@ def parse_args() -> argparse.Namespace:
         "--gaze-algorithm",
         choices=GAZE_ALGORITHM_VALUES,
         default="threshold",
-        help="Алгоритм слежения за взглядом: threshold, majority или adaptive.",
+        help="Алгоритм слежения за взглядом: threshold, majority, adaptive, ema или hysteresis.",
     )
     parser.add_argument(
         "--cursor-mode",
