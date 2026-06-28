@@ -52,6 +52,7 @@ class FrameResult:
     ratio_y: float | None
     confidence: float
     eyes_found: int
+    blink_detected: bool
 
 
 LEFT_EYE_CONTOUR = [
@@ -294,6 +295,48 @@ class GazeEstimator:
         return raw_direction, stable_direction
 
 
+class BlinkDetector:
+    def __init__(
+        self,
+        max_closed_frames: int = 3,
+        flash_frames: int = 6,
+        cooldown_frames: int = 12,
+    ) -> None:
+        self.max_closed_frames = max_closed_frames
+        self.flash_frames = flash_frames
+        self.cooldown_frames = cooldown_frames
+        self.closed_streak = 0
+        self.previous_open_eyes = 0
+        self.cooldown_remaining = 0
+        self.flash_remaining = 0
+
+    def update(self, eyes_found: int) -> bool:
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+        if self.flash_remaining > 0:
+            self.flash_remaining -= 1
+
+        if eyes_found <= 0:
+            self.closed_streak += 1
+            return False
+
+        blink_detected = (
+            self.previous_open_eyes > 0
+            and 0 < self.closed_streak <= self.max_closed_frames
+            and self.cooldown_remaining == 0
+        )
+        if blink_detected:
+            self.cooldown_remaining = self.cooldown_frames
+            self.flash_remaining = self.flash_frames
+
+        self.closed_streak = 0
+        self.previous_open_eyes = eyes_found
+        return blink_detected
+
+    def is_flashing(self) -> bool:
+        return self.flash_remaining > 0
+
+
 class CsvLogger:
     def __init__(self, path: Path | None) -> None:
         self.file = None
@@ -305,7 +348,15 @@ class CsvLogger:
         self.file = path.open("w", newline="", encoding="utf-8")
         self.writer = csv.writer(self.file)
         self.writer.writerow(
-            ["timestamp", "raw_direction", "stable_direction", "ratio_x", "ratio_y", "eyes_found"]
+            [
+                "timestamp",
+                "raw_direction",
+                "stable_direction",
+                "ratio_x",
+                "ratio_y",
+                "eyes_found",
+                "blink_detected",
+            ]
         )
 
     def write(self, result: FrameResult) -> None:
@@ -320,6 +371,7 @@ class CsvLogger:
                 "" if result.ratio_x is None else f"{result.ratio_x:.4f}",
                 "" if result.ratio_y is None else f"{result.ratio_y:.4f}",
                 result.eyes_found,
+                int(result.blink_detected),
             ]
         )
 
@@ -769,9 +821,32 @@ class CalibrationSession:
         panel_y = 34
         draw_panel(frame, (panel_x, panel_y), (panel_x + panel_w, panel_y + 210), 0.92)
 
-        put_text(frame, "Калибровка экрана", (panel_x + 24, panel_y + 40), 0.84, COLOR_TEXT, 2)
-        put_text(frame, "Смотрите на маркер и держите голову ровно", (panel_x + 24, panel_y + 73), 0.50, COLOR_MUTED)
-        put_text(frame, self.progress_label(), (panel_x + 24, panel_y + 108), 0.58, COLOR_ACCENT, 2)
+        put_text_box(
+            frame,
+            "Калибровка экрана",
+            (panel_x + 24, panel_y + 24, panel_x + panel_w - 24, panel_y + 58),
+            0.84,
+            COLOR_TEXT,
+            2,
+            align="center",
+        )
+        put_text_box(
+            frame,
+            "Смотрите на маркер и держите голову ровно",
+            (panel_x + 24, panel_y + 62, panel_x + panel_w - 24, panel_y + 90),
+            0.50,
+            COLOR_MUTED,
+            align="center",
+        )
+        put_text_box(
+            frame,
+            self.progress_label(),
+            (panel_x + 24, panel_y + 96, panel_x + panel_w - 24, panel_y + 124),
+            0.58,
+            COLOR_ACCENT,
+            2,
+            align="center",
+        )
 
         if self.active:
             target_x, target_y = self.current_target()
@@ -797,7 +872,14 @@ class CalibrationSession:
             )
 
         blend_rect(frame, (0, self.screen_h - 42), (self.screen_w, self.screen_h), COLOR_PANEL, 0.90)
-        put_text(frame, "Q - отменить калибровку", (40, self.screen_h - 15), 0.50, COLOR_TEXT)
+        put_text_box(
+            frame,
+            "Q - отменить калибровку",
+            (40, self.screen_h - 38, self.screen_w - 40, self.screen_h - 10),
+            0.50,
+            COLOR_TEXT,
+            align="left",
+        )
         return frame
 
     def build_mapper(self) -> ScreenMapper:
@@ -957,6 +1039,15 @@ def draw_landmark_eye(
         cv2.circle(frame, result.pupil_center, 8, (40, 240, 255), 1, cv2.LINE_AA)
 
 
+def draw_blink_effect(frame: np.ndarray) -> None:
+    height, width = frame.shape[:2]
+    blend_rect(frame, (0, 0), (width, height), (52, 96, 255), 0.08)
+    draw_panel(frame, (18, 18), (220, 74), 0.80)
+    put_text_box(frame, "моргание", (36, 28, 186, 62), 0.62, COLOR_WARN, 2, align="center")
+    cv2.circle(frame, (width - 54, 46), 14, COLOR_WARN, 2, cv2.LINE_AA)
+    cv2.circle(frame, (width - 54, 46), 5, COLOR_WARN, -1, cv2.LINE_AA)
+
+
 def average_gaze(results: list[GazeResult]) -> tuple[float | None, float | None, float]:
     known = [
         item
@@ -1042,6 +1133,70 @@ def put_text(
         frame,
         text,
         origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+def put_text_box(
+    frame: np.ndarray,
+    text: str,
+    box: tuple[int, int, int, int],
+    scale: float,
+    color: tuple[int, int, int] = COLOR_TEXT,
+    thickness: int = 1,
+    align: str = "left",
+) -> None:
+    x1, y1, x2, y2 = box
+    if Image is not None and ImageDraw is not None and ImageFont is not None:
+        font_size = max(10, int(round(scale * 32)))
+        font_key = ("bold" if thickness > 1 else "regular", font_size)
+        font = FONT_CACHE.get(font_key)
+        if font is None:
+            font_names = ["segoeuib.ttf", "arialbd.ttf"] if thickness > 1 else ["segoeui.ttf", "arial.ttf"]
+            for font_name in font_names:
+                try:
+                    font = ImageFont.truetype(f"C:/Windows/Fonts/{font_name}", font_size)
+                    break
+                except OSError:
+                    font = None
+            if font is None:
+                font = ImageFont.load_default()
+            FONT_CACHE[font_key] = font
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(rgb)
+        draw = ImageDraw.Draw(image)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+
+        if align == "center":
+            tx = x1 + max(0, (x2 - x1 - text_w) // 2)
+        elif align == "right":
+            tx = x2 - text_w
+        else:
+            tx = x1
+        ty = y1 + max(0, (y2 - y1 - text_h) // 2) - bbox[1]
+        draw.text((tx, ty), text, font=font, fill=(color[2], color[1], color[0]))
+        frame[:] = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        return
+
+    (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    if align == "center":
+        tx = x1 + max(0, (x2 - x1 - text_w) // 2)
+    elif align == "right":
+        tx = x2 - text_w
+    else:
+        tx = x1
+    ty = y1 + max(text_h, (y2 - y1 + text_h) // 2)
+    cv2.putText(
+        frame,
+        text,
+        (tx, ty),
         cv2.FONT_HERSHEY_SIMPLEX,
         scale,
         color,
@@ -1204,17 +1359,18 @@ def draw_hud(
         ratio_text = f"x {result.ratio_x:.2f}  y {result.ratio_y:.2f}"
     draw_metric(frame, "координаты", ratio_text, (content_x, panel_y + 238), content_w)
     draw_metric(frame, "глаза", str(result.eyes_found), (content_x, panel_y + 266), content_w)
-    draw_metric(frame, "курсор", status_label(cursor_status), (content_x, panel_y + 294), content_w)
-    draw_metric(frame, "журнал", "вкл" if log_enabled else "выкл", (content_x, panel_y + 322), content_w)
+    draw_metric(frame, "моргание", "да" if result.blink_detected else "нет", (content_x, panel_y + 294), content_w)
+    draw_metric(frame, "курсор", status_label(cursor_status), (content_x, panel_y + 322), content_w)
+    draw_metric(frame, "журнал", "вкл" if log_enabled else "выкл", (content_x, panel_y + 350), content_w)
 
-    put_text(frame, "движение", (content_x, panel_y + 364), 0.40, COLOR_MUTED)
-    put_text(frame, status_label(cursor_motion), (content_x, panel_y + 388), 0.43, COLOR_TEXT)
-    put_text(frame, "калибровка", (content_x, panel_y + 426), 0.40, COLOR_MUTED)
-    put_text(frame, calibration_status, (content_x, panel_y + 450), 0.43, COLOR_TEXT)
+    put_text(frame, "движение", (content_x, panel_y + 392), 0.40, COLOR_MUTED)
+    put_text(frame, status_label(cursor_motion), (content_x, panel_y + 416), 0.43, COLOR_TEXT)
+    put_text(frame, "калибровка", (content_x, panel_y + 454), 0.40, COLOR_MUTED)
+    put_text(frame, calibration_status, (content_x, panel_y + 478), 0.43, COLOR_TEXT)
 
     pad_size = min(content_w, max(132, height - panel_y - bottom_h - 490))
     if pad_size >= 120:
-        draw_gaze_pad(frame, result, estimator, (content_x, panel_y + 478), pad_size)
+        draw_gaze_pad(frame, result, estimator, (content_x, panel_y + 506), pad_size)
 
     chips = [
         (f"курсор {status_label(cursor_status)}", cursor_status == "on", COLOR_ACCENT),
@@ -1274,7 +1430,7 @@ def estimate_head_pose(landmarks, frame_width, frame_height):
     pitch, yaw, roll = angles.flatten()[:3]
     return pitch, yaw, roll
 
-def process_frame(frame, face_landmarker, estimator, flip=True):
+def process_frame(frame, face_landmarker, estimator, blink_detector: BlinkDetector | None = None, flip=True):
     if flip:
         frame = cv2.flip(frame, 1)
     frame_height, frame_width = frame.shape[:2]
@@ -1286,6 +1442,8 @@ def process_frame(frame, face_landmarker, estimator, flip=True):
     ratio_x, ratio_y, confidence = None, None, 0.0
     eyes_count = 0
     
+    blink_detected = False
+
     if landmark_result.face_landmarks:
         landmarks = landmark_result.face_landmarks[0]
 
@@ -1307,6 +1465,10 @@ def process_frame(frame, face_landmarker, estimator, flip=True):
 
         raw_ratio_x, raw_ratio_y, confidence = average_gaze(gaze_results)
         eyes_count = valid_eyes
+        if blink_detector is not None:
+            blink_detected = blink_detector.update(eyes_count)
+            if blink_detector.is_flashing():
+                draw_blink_effect(frame)
 
         if raw_ratio_x is not None:
             ratio_x = float(np.clip(raw_ratio_x, 0.0, 1.0))
@@ -1322,6 +1484,7 @@ def process_frame(frame, face_landmarker, estimator, flip=True):
         ratio_y=ratio_y,
         confidence=confidence,
         eyes_found=eyes_count,
+        blink_detected=blink_detected,
     )
 
 
@@ -1449,6 +1612,7 @@ class GazeStudioApp:
         self.calibration = CalibrationSession(self.screen_w, self.screen_h, calibration_samples)
         self.calibration_window: tk.Toplevel | None = None
         self.calibration_label: tk.Label | None = None
+        self.blink_detector = BlinkDetector()
         self.video_image = None
         self.calibration_image = None
         self.running = False
@@ -1463,6 +1627,7 @@ class GazeStudioApp:
         self.raw_var = tk.StringVar(value="-")
         self.confidence_var = tk.StringVar(value="0%")
         self.eyes_var = tk.StringVar(value="0")
+        self.blink_var = tk.StringVar(value="нет")
         self.ratio_var = tk.StringVar(value="x --  y --")
         self.cursor_var = tk.StringVar(value=status_label(self.cursor.status()))
         self.motion_var = tk.StringVar(value="пауза")
@@ -1554,11 +1719,12 @@ class GazeStudioApp:
         self._add_status_row(status_box, 2, "Сырой сигнал", self.raw_var)
         self._add_status_row(status_box, 3, "Уверенность", self.confidence_var)
         self._add_status_row(status_box, 4, "Глаза", self.eyes_var)
-        self._add_status_row(status_box, 5, "Координаты", self.ratio_var)
-        self._add_status_row(status_box, 6, "Курсор", self.cursor_var)
-        self._add_status_row(status_box, 7, "Движение", self.motion_var)
-        self._add_status_row(status_box, 8, "Калибровка", self.calibration_var)
-        self._add_status_row(status_box, 9, "Алгоритм", self.algorithm_var)
+        self._add_status_row(status_box, 5, "Моргание", self.blink_var)
+        self._add_status_row(status_box, 6, "Координаты", self.ratio_var)
+        self._add_status_row(status_box, 7, "Курсор", self.cursor_var)
+        self._add_status_row(status_box, 8, "Движение", self.motion_var)
+        self._add_status_row(status_box, 9, "Калибровка", self.calibration_var)
+        self._add_status_row(status_box, 10, "Алгоритм", self.algorithm_var)
 
         control_box = ttk.LabelFrame(side, text="Управление")
         control_box.grid(row=1, column=0, sticky="ew", pady=(10, 0))
@@ -1733,7 +1899,7 @@ class GazeStudioApp:
             self.stop()
             return
 
-        result = process_frame(frame, self.face_landmarker, self.estimator)
+        result = process_frame(frame, self.face_landmarker, self.estimator, self.blink_detector)
         if self.logger is not None:
             self.logger.write(result)
 
@@ -1759,6 +1925,7 @@ class GazeStudioApp:
         self.raw_var.set(direction_label(result.raw_direction).lower())
         self.confidence_var.set(f"{int(result.confidence * 100)}%")
         self.eyes_var.set(str(result.eyes_found))
+        self.blink_var.set("да" if result.blink_detected else "нет")
         if result.ratio_x is None or result.ratio_y is None:
             self.ratio_var.set("x --  y --")
         else:
@@ -1846,6 +2013,7 @@ def run(
         min_confidence=cursor_min_confidence,
         mode=cursor_mode,
     )
+    blink_detector = BlinkDetector()
     face_landmarker = create_face_landmarker()
     screen_w, screen_h = get_screen_size()
     calibration = CalibrationSession(screen_w, screen_h, calibration_samples)
@@ -1868,7 +2036,7 @@ def run(
             if not ok:
                 raise RuntimeError("Не удалось получить кадр с камеры.")
 
-            result = process_frame(frame, face_landmarker, estimator)
+            result = process_frame(frame, face_landmarker, estimator, blink_detector)
             logger.write(result)
 
             if calibration.active:
