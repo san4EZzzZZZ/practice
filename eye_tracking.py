@@ -8,7 +8,7 @@ import threading
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 import tkinter as tk
 from tkinter import ttk
 
@@ -1426,7 +1426,7 @@ def draw_hud(
     content_x = panel_x + 18
     content_w = sidebar_w - 36
 
-    put_text(frame, "Студия взгляда", (content_x, panel_y + 30), 0.68, COLOR_TEXT, 2)
+    put_text(frame, "Eye Tracking Studio", (content_x, panel_y + 30), 0.68, COLOR_TEXT, 2)
     put_text(frame, "отслеживание взгляда с веб-камеры", (content_x, panel_y + 55), 0.42, COLOR_MUTED)
 
     direction = direction_label(result.stable_direction)
@@ -1594,22 +1594,47 @@ def process_frame(frame, face_landmarker, estimator, blink_detector: BlinkDetect
 def draw_image_summary(frame: np.ndarray, result: FrameResult) -> None:
     height, width = frame.shape[:2]
     panel_w = min(420, max(300, width // 3))
-    panel_h = 152
+    panel_h = 168
     margin = 16
     draw_panel(frame, (margin, margin), (margin + panel_w, margin + panel_h), 0.80)
 
-    put_text(frame, "Поиск взгляда", (margin + 18, margin + 34), 0.66, COLOR_TEXT, 2)
-    put_text(frame, f"направление: {direction_label(result.stable_direction)}", (margin + 18, margin + 68), 0.44, COLOR_ACCENT)
+    inner_left = margin + 14
+    inner_right = margin + panel_w - 14
+    put_text_box(
+        frame,
+        "Поиск взгляда",
+        (inner_left, margin + 12, inner_right, margin + 45),
+        0.62,
+        COLOR_TEXT,
+        2,
+        align="center",
+    )
+    put_text_box(
+        frame,
+        f"направление: {direction_label(result.stable_direction)}",
+        (inner_left, margin + 50, inner_right, margin + 80),
+        0.42,
+        COLOR_ACCENT,
+        align="center",
+    )
 
     if result.ratio_x is None or result.ratio_y is None:
-        put_text(frame, "глаз не найден", (margin + 18, margin + 100), 0.44, COLOR_MUTED)
+        put_text_box(
+            frame,
+            "глаз не найден",
+            (inner_left, margin + 84, inner_right, margin + 114),
+            0.42,
+            COLOR_MUTED,
+            align="center",
+        )
     else:
-        put_text(
+        put_text_box(
             frame,
             f"координаты: x {result.ratio_x:.2f}  y {result.ratio_y:.2f}",
-            (margin + 18, margin + 100),
-            0.44,
+            (inner_left, margin + 84, inner_right, margin + 114),
+            0.42,
             COLOR_TEXT,
+            align="center",
         )
         gaze_x = int(result.ratio_x * width)
         gaze_y = int(result.ratio_y * height)
@@ -1618,7 +1643,14 @@ def draw_image_summary(frame: np.ndarray, result: FrameResult) -> None:
         cv2.line(frame, (gaze_x - 16, gaze_y), (gaze_x + 16, gaze_y), COLOR_ACCENT, 1, cv2.LINE_AA)
         cv2.line(frame, (gaze_x, gaze_y - 16), (gaze_x, gaze_y + 16), COLOR_ACCENT, 1, cv2.LINE_AA)
 
-    put_text(frame, f"уверенность: {int(result.confidence * 100)}%", (margin + 18, margin + 128), 0.44, COLOR_MUTED)
+    put_text_box(
+        frame,
+        f"уверенность: {int(result.confidence * 100)}%",
+        (inner_left, margin + 120, inner_right, margin + 150),
+        0.42,
+        COLOR_MUTED,
+        align="center",
+    )
 
 
 def collect_image_paths(image_dir: Path) -> list[Path]:
@@ -1635,6 +1667,36 @@ def output_path_for_image(source: Path, output_dir: Path | None) -> Path:
         return source.with_name(f"{source.stem}_gaze.png")
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir / f"{source.stem}_gaze.png"
+
+
+def read_image_unicode_safe(path: Path) -> np.ndarray | None:
+    try:
+        data = np.fromfile(str(path), dtype=np.uint8)
+    except OSError:
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+
+def write_image_unicode_safe(path: Path, frame: np.ndarray) -> bool:
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        ext = ".jpg"
+    elif suffix == ".png":
+        ext = ".png"
+    elif suffix == ".webp":
+        ext = ".webp"
+    elif suffix in {".tif", ".tiff"}:
+        ext = ".tiff"
+    else:
+        ext = ".png"
+
+    ok, encoded = cv2.imencode(ext, frame)
+    if not ok:
+        return False
+    encoded.tofile(str(path))
+    return True
 
 
 def run_image_mode(
@@ -1659,7 +1721,7 @@ def run_image_mode(
 
         for source in paths:
             estimator = GazeEstimator()
-            frame = cv2.imread(str(source))
+            frame = read_image_unicode_safe(source)
             if frame is None:
                 print(f"[skip] {source.name}: не удалось открыть файл")
                 continue
@@ -1672,7 +1734,8 @@ def run_image_mode(
             else:
                 target = output_path_for_image(source, output_dir)
 
-            cv2.imwrite(str(target), result.frame)
+            if not write_image_unicode_safe(target, result.frame):
+                raise RuntimeError(f"Не удалось сохранить файл: {target}")
             direction = direction_label(result.stable_direction)
             coords = "--, --" if result.ratio_x is None or result.ratio_y is None else f"{result.ratio_x:.2f}, {result.ratio_y:.2f}"
             print(f"{source.name} -> {target.name} | {direction} | {coords} | {int(result.confidence * 100)}%")
@@ -1699,7 +1762,7 @@ class GazeStudioApp:
         calibration_samples: int,
     ) -> None:
         self.root = tk.Tk()
-        self.root.title("Студия отслеживания взгляда")
+        self.root.title("Eye Tracking Studio")
         self.root.geometry("1180x760")
         self.root.minsize(980, 650)
 
@@ -1764,6 +1827,7 @@ class GazeStudioApp:
         file_menu.add_command(label="Запустить камеру", command=self.start, accelerator="F5")
         file_menu.add_command(label="Остановить камеру", command=self.stop, accelerator="F6")
         file_menu.add_separator()
+        file_menu.add_command(label="Анализировать изображение...", command=self.analyze_static_image)
         file_menu.add_command(label="Выход", command=self.close, accelerator="Ctrl+Q")
         menu.add_cascade(label="Файл", menu=file_menu)
 
@@ -1810,7 +1874,7 @@ class GazeStudioApp:
         status_box = ttk.LabelFrame(side, text="Отслеживание")
         status_box.grid(row=0, column=0, sticky="ew")
         status_box.columnconfigure(1, weight=1)
-        ttk.Label(status_box, text="Студия взгляда", style="Title.TLabel").grid(
+        ttk.Label(status_box, text="Eye Tracking Studio", style="Title.TLabel").grid(
             row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 2)
         )
         ttk.Label(status_box, textvariable=self.direction_var, style="BigValue.TLabel").grid(
@@ -1912,6 +1976,72 @@ class GazeStudioApp:
             self.logger = None
         self.status_var.set("Запись журнала выключена")
 
+    def _analyze_image_file(self, image_path: Path) -> tuple[FrameResult, Path]:
+        frame = read_image_unicode_safe(image_path)
+        if frame is None:
+            raise RuntimeError(f"Не удалось открыть файл: {image_path}")
+
+        estimator = GazeEstimator(algorithm=self.estimator.algorithm)
+        local_face_landmarker = self.face_landmarker
+        owns_landmarker = False
+        if local_face_landmarker is None:
+            local_face_landmarker = create_face_landmarker()
+            owns_landmarker = True
+
+        try:
+            result = process_frame(frame, local_face_landmarker, estimator, flip=False)
+            draw_image_summary(result.frame, result)
+            target = output_path_for_image(image_path, None)
+            if not write_image_unicode_safe(target, result.frame):
+                raise RuntimeError(f"Не удалось сохранить файл: {target}")
+            if self.logger is not None:
+                self.logger.write(result)
+            return result, target
+        finally:
+            if owns_landmarker and local_face_landmarker is not None:
+                local_face_landmarker.close()
+
+    def _display_static_image_result(self, image_path: Path, result: FrameResult, target: Path) -> None:
+        self.video_image = self.frame_to_photo(result.frame, 860, 640)
+        self.video_label.configure(image=self.video_image)
+        self.status_var.set(f"Изображение обработано: {image_path.name} -> {target.name}")
+        self.direction_var.set(direction_label(result.stable_direction))
+        self.raw_var.set(direction_label(result.raw_direction).lower())
+        self.confidence_var.set(f"{int(result.confidence * 100)}%")
+        self.eyes_var.set(str(result.eyes_found))
+        self.blink_var.set("да" if result.blink_detected else "нет")
+        if result.ratio_x is None or result.ratio_y is None:
+            self.ratio_var.set("x --  y --")
+        else:
+            self.ratio_var.set(f"x {result.ratio_x:.2f}  y {result.ratio_y:.2f}")
+
+    def analyze_static_image(self) -> None:
+        if self.running:
+            self.stop()
+        image_file = filedialog.askopenfilename(
+            title="Выберите изображение",
+            filetypes=[
+                ("Изображения", "*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff"),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if not image_file:
+            return
+
+        source = Path(image_file)
+        try:
+            self.status_var.set(f"Анализ изображения: {source.name}...")
+            self.root.update_idletasks()
+            result, target = self._analyze_image_file(source)
+            self._display_static_image_result(source, result, target)
+            messagebox.showinfo(
+                "Eye Tracking Studio",
+                f"Изображение обработано.\n\nСохранено: {target.name}\nНаправление: {direction_label(result.stable_direction)}",
+            )
+        except Exception as exc:
+            self.status_var.set(str(exc))
+            messagebox.showerror("Eye Tracking Studio", str(exc))
+
     def start(self) -> None:
         if self.running:
             return
@@ -1933,7 +2063,7 @@ class GazeStudioApp:
             self.update_frame()
         except Exception as exc:
             self.status_var.set(str(exc))
-            messagebox.showerror("Студия отслеживания взгляда", str(exc))
+            messagebox.showerror("Eye Tracking Studio", str(exc))
 
     def _start_model_loader(self) -> None:
         self.model_loading = True
@@ -2080,7 +2210,7 @@ class GazeStudioApp:
     def show_about(self) -> None:
         messagebox.showinfo(
             "О программе",
-            "Студия отслеживания взгляда\n\nДемонстрация отслеживания взгляда через веб-камеру на OpenCV и MediaPipe.",
+            "Eye Tracking Studio\n\nДемонстрация отслеживания взгляда через веб-камеру на OpenCV и MediaPipe.",
         )
 
     def close(self) -> None:
@@ -2187,7 +2317,7 @@ def run(
             f"Не удалось открыть камеру #{camera_index}. Попробуйте другой индекс через --camera."
         )
 
-    window_name = "Студия взгляда"
+    window_name = "Eye Tracking Studio"
     calibration_window = "Калибровка"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 960, 720)
