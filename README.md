@@ -102,7 +102,8 @@ python eye_tracking.py --image-dir samples --output-dir output/gaze
 
 ```text
 .
-├── eye_tracking.py      # основной скрипт приложения
+├── launch.py            # точка входа приложения
+├── eye_tracking.py      # основной модуль приложения
 ├── requirements.txt     # зависимости проекта
 ├── README.md            # описание проекта
 └── .cache/              # кэш моделей и служебных файлов
@@ -128,7 +129,13 @@ pip install -r requirements.txt
 
 ## Запуск
 
-Обычный запуск:
+Обычный запуск через файл старта:
+
+```bash
+python launch.py
+```
+
+Если нужен прямой запуск модуля:
 
 ```bash
 python eye_tracking.py
@@ -221,7 +228,7 @@ python eye_tracking.py --cursor-smoothing 0.70
 
 Для защиты или показа проекта удобно использовать такой порядок:
 
-1. Запустить программу командой `python eye_tracking.py`.
+1. Запустить программу командой `python launch.py`.
 2. Показать, что система находит глаза и отображает направление взгляда.
 3. Посмотреть в разные стороны и показать изменение `CURRENT GAZE`.
 4. Нажать `C` и пройти калибровку по точкам.
